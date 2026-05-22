@@ -1084,12 +1084,26 @@ def load_dataset(data_id: int, device: Optional[torch.device]=None):
         require_ogb()
         dataset = PygNodePropPredDataset(name='ogbn-mag', root='/tmp/ogbn_mag')
         raw_data = dataset[0]
+    
+        if hasattr(raw_data, 'x_dict'):
+            x = raw_data.x_dict['paper']
+            edge_index = raw_data.edge_index_dict[('paper', 'cites', 'paper')]
+            y = raw_data.y_dict['paper'].view(-1).long()
+            num_nodes = raw_data.num_nodes_dict['paper']
+    
+        else:
+            x = raw_data['paper'].x
+            edge_index = raw_data['paper', 'cites', 'paper'].edge_index
+            y = raw_data['paper'].y.view(-1).long()
+            num_nodes = raw_data['paper'].num_nodes
+    
         data = Data(
-            x=raw_data['paper'].x,
-            edge_index=raw_data['paper', 'cites', 'paper'].edge_index,
-            y=raw_data['paper'].y.view(-1).long(),
-            num_nodes=raw_data['paper'].num_nodes,
+            x=x,
+            edge_index=edge_index,
+            y=y,
+            num_nodes=num_nodes,
         )
+    
         data = attach_split_masks(data, dataset.get_idx_split(), node_type='paper')
         data.ogb_name = 'ogbn-mag'
         data.eval_metric = 'acc'
