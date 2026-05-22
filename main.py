@@ -28,10 +28,6 @@ except ImportError:
     Evaluator = None
     PygNodePropPredDataset = None
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 def nan_to_num_safe(x: Tensor, nan: float=0.0, posinf: float=0.0, neginf: float=0.0) -> Tensor:
     if torch.is_complex(x):
@@ -76,6 +72,17 @@ def collect_provided_args(argv: List[str]) -> set:
 def set_if_unprovided(args, provided: set, name: str, value) -> None:
     if name not in provided:
         setattr(args, name, value)
+
+
+
+def set_seed(seed: int) -> None:
+    random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    # Keep this deterministic enough for Planetoid/Cora comparisons.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def is_homophilic_builtin(data_id: int) -> bool:
     return int(data_id) in {0, 1, 2}
@@ -144,6 +151,200 @@ class PhasePreservingNodeNorm(nn.Module):
         mean = x.mean(dim=-1, keepdim=True)
         var = (x - mean).square().mean(dim=-1, keepdim=True)
         return torch.nan_to_num((x - mean) * torch.rsqrt(var + self.eps))
+
+
+
+class LegacyNodeNorm(nn.Module):
+    """Node-wise normalization used by the non-adaptive GESC baseline.
+
+    This intentionally differs from PhasePreservingNodeNorm: it normalizes the
+    real/imaginary channels over feature dimensions per node, matching the
+    attached non-adaptive GESC implementation.
+    """
+
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        if torch.is_complex(x):
+            xr = torch.view_as_real(x)
+            mean = xr.mean(dim=-2, keepdim=True)
+            std = xr.std(dim=-2, keepdim=True).clamp_min(self.eps)
+            xn = (xr - mean) / std
+            return torch.view_as_complex(torch.nan_to_num(xn))
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True).clamp_min(self.eps)
+        return torch.nan_to_num((x - mean) / std)
+
+
+class GESCSoftmaxLayer(nn.Module):
+    """Non-adaptive GESC/GET-SIC layer from the attached strong baseline.
+
+    The key difference from ASCiiLayer is that the SIC coefficient is fixed
+    per layer (`sic_strength`) instead of being edge-adaptive. This is useful
+    for Cora, where the simpler baseline was reported to work better.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        gamma: float = 1.0,
+        use_bias: bool = False,
+        attn_dropout: float = 0.5,
+        use_activation: bool = True,
+        use_nodenorm: bool = True,
+    ):
+        super().__init__()
+        self.in_dim = dim
+        self.out_dim = dim
+        self.M = num_heads
+        self.gamma = gamma
+        self.attn_dropout = attn_dropout
+        self.use_activation = use_activation
+        self.W = nn.ModuleList([ComplexLinear(dim, dim, bias=use_bias) for _ in range(self.M)])
+        self.Q = nn.ModuleList([ComplexLinear(dim, dim, bias=False) for _ in range(self.M)])
+        self._msg_gate = nn.Parameter(torch.tensor(0.5))
+        self.act = ModReLU(dim) if use_activation else nn.Identity()
+        self.nodenorm = LegacyNodeNorm() if use_nodenorm else nn.Identity()
+
+    @property
+    def msg_gate(self) -> Tensor:
+        return torch.sigmoid(self._msg_gate)
+
+    def forward(self, h: Tensor, edge_index: Tensor, sic_strength: float = 0.0) -> Tensor:
+        if edge_index.numel() == 0:
+            return self.act(self.nodenorm(h))
+
+        src, dst = edge_index
+        N = h.size(0)
+        h_src_in = h[src]
+        h_dst_in = h[dst]
+        h_dst_norm2 = (h_dst_in.real.square() + h_dst_in.imag.square()).sum(dim=1, keepdim=True)
+        h_dst_norm2 = h_dst_norm2.clamp_min(1e-6)
+        updates_sum = torch.zeros((N, self.out_dim), dtype=torch.cfloat, device=h.device)
+        gate = self.msg_gate
+
+        for m in range(self.M):
+            Wh_src = self.W[m](h_src_in)
+            transported = nan_to_num_safe(Wh_src)
+
+            hi_conj_dot = torch.sum(torch.conj(h_dst_in) * transported, dim=1, keepdim=True)
+            hi_conj_dot = nan_to_num_safe(hi_conj_dot)
+            proj = h_dst_in * (hi_conj_dot / h_dst_norm2)
+            proj = nan_to_num_safe(proj)
+
+            r_attn = transported - float(sic_strength) * proj
+            r_attn = nan_to_num_safe(r_attn)
+
+            Qhi = nan_to_num_safe(self.Q[m](h_dst_in))
+            s = torch.sum(torch.conj(Qhi) * r_attn, dim=1)
+            s = nan_to_num_safe(s)
+            logits = self.gamma * torch.abs(s) / math.sqrt(max(1, self.out_dim))
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+            alpha = softmax(logits, dst, num_nodes=N)
+            alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
+            alpha = F.dropout(alpha, p=self.attn_dropout, training=self.training)
+
+            base = gate.to(transported.dtype) * r_attn + (1.0 - gate).to(transported.dtype) * transported
+            with torch.no_grad():
+                sim = F.cosine_similarity(h_src_in.real, h_dst_in.real, dim=-1).clamp(min=-1.0, max=1.0)
+                sign = torch.sign(sim)
+            base = base * (0.5 + 0.5 * sign.to(base.dtype).unsqueeze(-1))
+
+            base = nan_to_num_safe(base)
+            msg = alpha.unsqueeze(-1).to(base.dtype) * base
+            msg = nan_to_num_safe(msg)
+            updates_sum.index_add_(0, dst, msg)
+
+        h_new = h + updates_sum
+        h_new = nan_to_num_safe(h_new)
+        h_new = self.nodenorm(h_new)
+        return self.act(h_new)
+
+
+class GESCSoftmaxNet(nn.Module):
+    """Full non-adaptive GESC baseline, adapted to the ASCii training API."""
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        edge_index: Tensor,
+        num_nodes: int,
+        num_heads: int = 4,
+        gamma: float = 0.1,
+        attn_dropout: float = 0.2,
+        feat_dropout: float = 0.5,
+        readout_dropout: float = 0.5,
+        layers: int = 2,
+        sic_first: float = 1.5,
+        alpha_skip: float = 0.1,
+        jk_mode: str = 'concat',
+        use_nodenorm: bool = True,
+    ):
+        super().__init__()
+        if jk_mode == 'last':
+            # The legacy baseline only had concat/mean. Map last to mean rather
+            # than failing in sweeps that reuse ASCii CLI options.
+            jk_mode = 'mean'
+        assert jk_mode in ['concat', 'mean']
+        self.edge_index = edge_index
+        self.num_nodes = num_nodes
+        self.num_classes = num_classes
+        self.feat_drop = nn.Dropout(feat_dropout)
+        self.alpha_skip = alpha_skip
+        self.layers_num = layers
+        self.jk_mode = jk_mode
+        self.enc = ComplexLinear(in_dim, hidden_dim, bias=True)
+        self.layers = nn.ModuleList([
+            GESCSoftmaxLayer(
+                hidden_dim,
+                num_heads=num_heads,
+                gamma=gamma,
+                attn_dropout=attn_dropout,
+                use_activation=(i < layers - 1),
+                use_nodenorm=use_nodenorm,
+            )
+            for i in range(layers)
+        ])
+        self.sic_vals = [float(sic_first)] + [0.0] * max(0, layers - 1)
+        cls_in = hidden_dim * 2 * layers if jk_mode == 'concat' else hidden_dim * 2
+        self.cls_norm = nn.LayerNorm(cls_in)
+        self.cls_drop = nn.Dropout(readout_dropout)
+        self.cls = nn.Linear(cls_in, num_classes)
+        self.last_homo_logits = None
+
+    def forward(
+        self,
+        x_real: Tensor,
+        edge_index_override: Optional[Tensor] = None,
+        return_aux: bool = False,
+        recompute_static: bool = False,
+    ):
+        del recompute_static
+        self.last_homo_logits = None
+        x_real = self.feat_drop(torch.nan_to_num(x_real.float(), nan=0.0, posinf=0.0, neginf=0.0))
+        x = x_real.to(torch.cfloat)
+        h = self.enc(x)
+        h0 = h.detach()
+        ei = self.edge_index if edge_index_override is None else edge_index_override
+        hs = []
+        for i, layer in enumerate(self.layers):
+            h_new = layer(h, ei, sic_strength=self.sic_vals[i])
+            h = (1.0 - self.alpha_skip) * h_new + self.alpha_skip * h0
+            hs.append(h)
+        h_out = torch.cat(hs, dim=-1) if self.jk_mode == 'concat' else torch.stack(hs, dim=0).mean(dim=0)
+        z = torch.view_as_real(h_out).reshape(h_out.size(0), -1)
+        z = self.cls_norm(z)
+        z = self.cls_drop(z)
+        logits = self.cls(z)
+        if return_aux:
+            return logits, logits.new_tensor(0.0)
+        return logits
+
 
 @torch.no_grad()
 def normalize_feature_view(x: Tensor, eps: float=1e-12) -> Tensor:
@@ -637,6 +838,8 @@ def supervised_loss_from_logits(logits: Tensor, y: Tensor, task_type: str, label
 
 def model_zero(model: nn.Module) -> Tensor:
     for p in model.parameters():
+        if torch.is_complex(p):
+            return p.real.new_tensor(0.0)
         return p.new_tensor(0.0)
     return torch.tensor(0.0)
 
@@ -1005,11 +1208,63 @@ def apply_homophily_defaults(args, provided: set) -> None:
     set_if_unprovided(args, provided, 'homo_branch_max_weight', 0.65)
     set_if_unprovided(args, provided, 'learn_homo_branch_weight', True)
 
+
+def resolve_base_model(args) -> str:
+    """Auto policy: use the non-adaptive GESC baseline on Cora, ASCii elsewhere."""
+    requested = str(args.base_model).lower()
+    if requested != 'auto':
+        return requested
+    return 'gesc' if int(args.data) == 0 else 'adaptive'
+
+
+def apply_gesc_defaults(args, provided: set) -> None:
+    """Restore the attached non-adaptive GESC defaults for selected datasets.
+
+    This intentionally runs *after* apply_homophily_defaults so Cora can fall
+    back to the simpler baseline unless the user explicitly overrides a value.
+    """
+    set_if_unprovided(args, provided, 'lr', 0.001)
+    set_if_unprovided(args, provided, 'weight_decay', 0.0005)
+    set_if_unprovided(args, provided, 'heads', 4)
+    set_if_unprovided(args, provided, 'hidden', 64)
+    set_if_unprovided(args, provided, 'gamma', 0.1)
+    set_if_unprovided(args, provided, 'attn_dropout', 0.2)
+    set_if_unprovided(args, provided, 'feat_dropout', 0.5)
+    set_if_unprovided(args, provided, 'readout_dropout', 0.5)
+    set_if_unprovided(args, provided, 'layers', 2)
+    set_if_unprovided(args, provided, 'sic_first', 1.5)
+    set_if_unprovided(args, provided, 'alpha_skip', 0.1)
+    set_if_unprovided(args, provided, 'jk', 'concat')
+    set_if_unprovided(args, provided, 'label_smooth', 0.0)
+    set_if_unprovided(args, provided, 'dropedge', 0.0)
+    set_if_unprovided(args, provided, 'warmup', 50)
+    set_if_unprovided(args, provided, 'patience', 200)
+    set_if_unprovided(args, provided, 'consistency_w', 0.1)
+    set_if_unprovided(args, provided, 'cons_T', 2.0)
+    set_if_unprovided(args, provided, 'use_cs', True)
+    set_if_unprovided(args, provided, 'cs_corr_layers', 50)
+    set_if_unprovided(args, provided, 'cs_corr_alpha', 0.5)
+    set_if_unprovided(args, provided, 'cs_smooth_layers', 50)
+    set_if_unprovided(args, provided, 'cs_smooth_alpha', 0.8)
+    set_if_unprovided(args, provided, 'use_lp', True)
+    set_if_unprovided(args, provided, 'lp_layers', 50)
+    set_if_unprovided(args, provided, 'lp_alpha', 0.9)
+    set_if_unprovided(args, provided, 'lp_blend', 0.2)
+    set_if_unprovided(args, provided, 'use_preprop', False)
+    set_if_unprovided(args, provided, 'preprop_K', 10)
+    set_if_unprovided(args, provided, 'preprop_alpha', 0.1)
+    set_if_unprovided(args, provided, 'preprop_dropout', 0.0)
+    set_if_unprovided(args, provided, 'use_homo_feature_boost', False)
+    set_if_unprovided(args, provided, 'use_homo_branch', False)
+    set_if_unprovided(args, provided, 'homo_aux_w', 0.0)
+    set_if_unprovided(args, provided, 'eta_reg', 0.0)
+
 def train_main() -> None:
     parser = argparse.ArgumentParser(description='ASCii: Adaptive Gauge-Invariant Self-Interference Control')
     parser.add_argument('data', type=int, help='0=Cora,1=Citeseer,2=Pubmed,3=Chameleon,4=Squirrel,5=Actor,6=Cornell,7=Texas,8=Wisconsin,9=ogbn-arxiv,10=ogbn-proteins,11=ogbn-mag')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--base_model', '--base-model', dest='base_model', type=str, default='auto', choices=['auto', 'adaptive', 'gesc'], help='auto uses non-adaptive GESC on Cora and adaptive ASCii elsewhere.')
     parser.add_argument('--epochs', type=int, default=1000)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--weight_decay', type=float, default=0.0005)
@@ -1020,6 +1275,7 @@ def train_main() -> None:
     parser.add_argument('--feat_dropout', type=float, default=0.5)
     parser.add_argument('--readout_dropout', type=float, default=0.5)
     parser.add_argument('--layers', type=int, default=2)
+    parser.add_argument('--sic_first', type=float, default=1.5, help='Fixed first-layer SIC strength used by --base_model gesc.')
     parser.add_argument('--alpha_skip', type=float, default=0.1)
     parser.add_argument('--jk', type=str, default='concat', choices=['last', 'concat', 'mean'])
     parser.add_argument('--use_nodenorm', action=argparse.BooleanOptionalAction, default=True)
@@ -1086,13 +1342,16 @@ def train_main() -> None:
     provided_args = collect_provided_args(sys.argv[1:])
     args = parser.parse_args()
     apply_homophily_defaults(args, provided_args)
+    args.resolved_base_model = resolve_base_model(args)
+    if args.resolved_base_model == 'gesc':
+        apply_gesc_defaults(args, provided_args)
+    #set_seed(args.seed)
 
     if not 0.0 <= args.eta_max <= 1.0:
         raise ValueError('--eta_max must be in [0, 1].')
     if not 0.0 <= args.lambda_attn <= 1.0:
         raise ValueError('--lambda_attn must be in [0, 1].')
 
-    set_seed(args.seed)
     device = torch.device(args.device)
 
     dataset, data = load_dataset(args.data, device=None)
@@ -1181,42 +1440,63 @@ def train_main() -> None:
 
     in_dim = int(data.x.size(-1))
 
-    model = ASCiiNet(
-        in_dim=in_dim,
-        hidden_dim=args.hidden,
-        num_classes=num_classes,
-        edge_index=model_edge_index,
-        num_nodes=data.num_nodes,
-        num_heads=args.heads,
-        gamma=args.gamma,
-        attn_dropout=args.attn_dropout,
-        feat_dropout=args.feat_dropout,
-        readout_dropout=args.readout_dropout,
-        layers=args.layers,
-        eta_max=args.eta_max,
-        eta_bar=args.eta_bar,
-        lambda_attn=args.lambda_attn,
-        alpha_skip=args.alpha_skip,
-        jk_mode=args.jk,
-        readout_rank=args.readout_rank,
-        readout_hidden=args.readout_hidden,
-        use_nodenorm=args.use_nodenorm,
-        use_phase=args.use_phase,
-        phase_scale=args.phase_scale,
-        edge_chunk_size=args.edge_chunk_size,
-        static_chunk_size=args.static_chunk_size,
-        checkpoint_layers=args.checkpoint_layers,
-        attn_mode=args.attn_mode,
-        use_homo_branch=bool(args.use_homo_branch),
-        homo_branch_hidden=args.homo_branch_hidden,
-        homo_branch_dropout=args.homo_branch_dropout,
-        homo_branch_layers=args.homo_branch_layers,
-        homo_branch_weight=args.homo_branch_weight,
-        homo_branch_max_weight=args.homo_branch_max_weight,
-        learn_homo_branch_weight=args.learn_homo_branch_weight,
-    ).to(device)
+    if args.resolved_base_model == 'gesc':
+        model = GESCSoftmaxNet(
+            in_dim=in_dim,
+            hidden_dim=args.hidden,
+            num_classes=num_classes,
+            edge_index=model_edge_index,
+            num_nodes=data.num_nodes,
+            num_heads=args.heads,
+            gamma=args.gamma,
+            attn_dropout=args.attn_dropout,
+            feat_dropout=args.feat_dropout,
+            readout_dropout=args.readout_dropout,
+            layers=args.layers,
+            sic_first=args.sic_first,
+            alpha_skip=args.alpha_skip,
+            jk_mode=args.jk,
+            use_nodenorm=args.use_nodenorm,
+        ).to(device)
+    else:
+        model = ASCiiNet(
+            in_dim=in_dim,
+            hidden_dim=args.hidden,
+            num_classes=num_classes,
+            edge_index=model_edge_index,
+            num_nodes=data.num_nodes,
+            num_heads=args.heads,
+            gamma=args.gamma,
+            attn_dropout=args.attn_dropout,
+            feat_dropout=args.feat_dropout,
+            readout_dropout=args.readout_dropout,
+            layers=args.layers,
+            eta_max=args.eta_max,
+            eta_bar=args.eta_bar,
+            lambda_attn=args.lambda_attn,
+            alpha_skip=args.alpha_skip,
+            jk_mode=args.jk,
+            readout_rank=args.readout_rank,
+            readout_hidden=args.readout_hidden,
+            use_nodenorm=args.use_nodenorm,
+            use_phase=args.use_phase,
+            phase_scale=args.phase_scale,
+            edge_chunk_size=args.edge_chunk_size,
+            static_chunk_size=args.static_chunk_size,
+            checkpoint_layers=args.checkpoint_layers,
+            attn_mode=args.attn_mode,
+            use_homo_branch=bool(args.use_homo_branch),
+            homo_branch_hidden=args.homo_branch_hidden,
+            homo_branch_dropout=args.homo_branch_dropout,
+            homo_branch_layers=args.homo_branch_layers,
+            homo_branch_weight=args.homo_branch_weight,
+            homo_branch_max_weight=args.homo_branch_max_weight,
+            learn_homo_branch_weight=args.learn_homo_branch_weight,
+        ).to(device)
 
-    if not args.mini_batch:
+    print(f'[info] base_model={args.resolved_base_model} data={args.data} hidden={args.hidden} layers={args.layers} heads={args.heads} lr={args.lr} wd={args.weight_decay}')
+
+    if not args.mini_batch and hasattr(model, 'prepare_static_graph'):
         model.prepare_static_graph(data.x, data.edge_index)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
