@@ -7,11 +7,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch_geometric.data import Data
 from torch_geometric.datasets import Planetoid, WikipediaNetwork, Actor, WebKB
 from torch_geometric.nn import APPNP, LabelPropagation
 from torch_geometric.nn.models import CorrectAndSmooth
 from torch_geometric.utils import add_remaining_self_loops, degree, remove_self_loops, softmax, to_undirected
 from tqdm import tqdm
+
+try:
+    from ogb.nodeproppred import Evaluator, PygNodePropPredDataset
+except ImportError:
+    Evaluator = None
+    PygNodePropPredDataset = None
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -323,30 +330,145 @@ class ASCiiNet(nn.Module):
             return (logits, eta_reg)
         return logits
 
+def require_ogb() -> None:
+    if PygNodePropPredDataset is None or Evaluator is None:
+        raise ImportError("OGB datasets require the 'ogb' package. Install with: pip install ogb")
+
+
+def make_mask(num_nodes: int, idx: Tensor) -> Tensor:
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    mask[idx.view(-1).long()] = True
+    return mask
+
+
+def attach_split_masks(data: Data, split_idx, node_type: Optional[str]=None) -> Data:
+    def pick(split_name: str) -> Tensor:
+        value = split_idx[split_name]
+        if isinstance(value, dict):
+            if node_type is None:
+                raise ValueError('node_type must be provided for heterogeneous OGB splits.')
+            value = value[node_type]
+        return value
+
+    data.train_mask = make_mask(data.num_nodes, pick('train'))
+    data.val_mask = make_mask(data.num_nodes, pick('valid'))
+    data.test_mask = make_mask(data.num_nodes, pick('test'))
+    return data
+
+
+def add_ogbn_proteins_features(data: Data) -> Data:
+    """OGBN-Proteins has edge features but no node features; aggregate incoming edge attrs."""
+    if getattr(data, 'x', None) is None:
+        if getattr(data, 'edge_attr', None) is None:
+            raise ValueError('ogbn-proteins requires edge_attr to build node features.')
+        dst = data.edge_index[1]
+        x = torch.zeros((data.num_nodes, data.edge_attr.size(-1)), dtype=data.edge_attr.dtype)
+        x.index_add_(0, dst, data.edge_attr)
+        data.x = x
+    return data
+
+
+def infer_num_node_features(dataset, data) -> int:
+    value = getattr(dataset, 'num_node_features', None)
+    if value is not None and int(value) > 0:
+        return int(value)
+    value = getattr(dataset, 'num_features', None)
+    if value is not None and int(value) > 0:
+        return int(value)
+    return int(data.x.size(-1))
+
+
+def infer_num_classes(dataset, data) -> int:
+    if getattr(data, 'task_type', 'multiclass') == 'multilabel':
+        return int(data.y.size(-1))
+    value = getattr(dataset, 'num_classes', None)
+    if value is not None and int(value) > 0:
+        return int(value)
+    return int(data.y.max().item() + 1)
+
+
+def supervised_loss(logits: Tensor, y: Tensor, mask: Tensor, task_type: str, label_smooth: float=0.0) -> Tensor:
+    if task_type == 'multilabel':
+        return F.binary_cross_entropy_with_logits(logits[mask], y[mask].float())
+    return cross_entropy_with_label_smoothing(logits[mask], y[mask].view(-1).long(), smoothing=label_smooth)
+
+
+def prediction_consistency(logits1: Tensor, logits2_detached: Tensor, task_type: str, T: float=2.0) -> Tensor:
+    if task_type == 'multilabel':
+        return F.mse_loss(torch.sigmoid(logits1), torch.sigmoid(logits2_detached))
+    return js_consistency(logits1, logits2_detached, T=T)
+
+
 def load_dataset(data_id: int, device: Optional[torch.device]=None):
     if data_id == 0:
         dataset = Planetoid(root='/tmp/Cora', name='Cora')
+        data = dataset[0]
     elif data_id == 1:
         dataset = Planetoid(root='/tmp/Citeseer', name='Citeseer')
+        data = dataset[0]
     elif data_id == 2:
         dataset = Planetoid(root='/tmp/Pubmed', name='Pubmed')
+        data = dataset[0]
     elif data_id == 3:
         dataset = WikipediaNetwork(root='/tmp/Chameleon', name='chameleon')
+        data = dataset[0]
     elif data_id == 4:
         dataset = WikipediaNetwork(root='/tmp/Squirrel', name='squirrel')
+        data = dataset[0]
     elif data_id == 5:
         dataset = Actor(root='/tmp/Actor')
+        data = dataset[0]
     elif data_id == 6:
         dataset = WebKB(root='/tmp/Cornell', name='Cornell')
+        data = dataset[0]
     elif data_id == 7:
         dataset = WebKB(root='/tmp/Texas', name='Texas')
-    else:
+        data = dataset[0]
+    elif data_id in (8, 9):
         dataset = WebKB(root='/tmp/Wisconsin', name='Wisconsin')
-    data = dataset[0]
-    if data.train_mask.dim() == 2:
+        data = dataset[0]
+    elif data_id == 10:
+        require_ogb()
+        dataset = PygNodePropPredDataset(name='ogbn-arxiv', root='/tmp/ogbn_arxiv')
+        data = attach_split_masks(dataset[0], dataset.get_idx_split())
+        data.y = data.y.view(-1).long()
+        data.ogb_name = 'ogbn-arxiv'
+        data.eval_metric = 'acc'
+        data.task_type = 'multiclass'
+    elif data_id == 11:
+        require_ogb()
+        dataset = PygNodePropPredDataset(name='ogbn-proteins', root='/tmp/ogbn_proteins')
+        data = attach_split_masks(add_ogbn_proteins_features(dataset[0]), dataset.get_idx_split())
+        data.y = data.y.float()
+        data.ogb_name = 'ogbn-proteins'
+        data.eval_metric = 'rocauc'
+        data.task_type = 'multilabel'
+    elif data_id == 12:
+        require_ogb()
+        dataset = PygNodePropPredDataset(name='ogbn-mag', root='/tmp/ogbn_mag')
+        raw_data = dataset[0]
+        # This homogeneous version uses the paper citation subgraph, which matches the paper-node
+        # classification target and keeps the model interface unchanged.
+        data = Data(
+            x=raw_data['paper'].x,
+            edge_index=raw_data['paper', 'cites', 'paper'].edge_index,
+            y=raw_data['paper'].y.view(-1).long(),
+            num_nodes=raw_data['paper'].num_nodes,
+        )
+        data = attach_split_masks(data, dataset.get_idx_split(), node_type='paper')
+        data.ogb_name = 'ogbn-mag'
+        data.eval_metric = 'acc'
+        data.task_type = 'multiclass'
+    else:
+        raise ValueError('Unknown data id. Use 0-8 for built-in datasets or 10=ogbn-arxiv, 11=ogbn-proteins, 12=ogbn-mag.')
+    if hasattr(data, 'train_mask') and data.train_mask.dim() == 2:
         data.train_mask = data.train_mask[:, 0]
         data.val_mask = data.val_mask[:, 0]
         data.test_mask = data.test_mask[:, 0]
+    if data.y.dim() == 2 and data.y.size(-1) == 1:
+        data.y = data.y.view(-1).long()
+    data.task_type = getattr(data, 'task_type', 'multiclass')
+    data.eval_metric = getattr(data, 'eval_metric', 'acc')
     if device is not None:
         data = data.to(device)
     return (dataset, data)
@@ -377,23 +499,43 @@ def evaluate(model: nn.Module, data, args) -> Tuple[float, float, float, Tensor]
     model.eval()
     logits_eval = model(data.x, edge_index_override=data.edge_index)
     pred_eval = logits_eval
-    if args.use_cs:
+    task_type = getattr(data, 'task_type', 'multiclass')
+    eval_metric = getattr(data, 'eval_metric', 'acc')
+
+    if task_type != 'multilabel' and args.use_cs:
         y_smooth = correct_and_smooth_compat(logits_eval, data.y, data.train_mask, data.edge_index, cs_corr_layers=args.cs_corr_layers, cs_corr_alpha=args.cs_corr_alpha, cs_smooth_layers=args.cs_smooth_layers, cs_smooth_alpha=args.cs_smooth_alpha, autoscale=True)
         pred_eval = (y_smooth + 1e-12).log()
-    if args.use_lp:
+    if task_type != 'multilabel' and args.use_lp:
         lp = LabelPropagation(num_layers=args.lp_layers, alpha=args.lp_alpha)
         y_lp = lp(data.y, data.edge_index, mask=data.train_mask)
         probs = F.softmax(pred_eval, dim=-1) * (1.0 - args.lp_blend) + y_lp * args.lp_blend
         pred_eval = (probs + 1e-12).log()
+
+    if eval_metric == 'rocauc':
+        evaluator = Evaluator(name=data.ogb_name)
+        scores = torch.sigmoid(pred_eval)
+        train_score = evaluator.eval({'y_true': data.y[data.train_mask].detach().cpu(), 'y_pred': scores[data.train_mask].detach().cpu()})['rocauc']
+        val_score = evaluator.eval({'y_true': data.y[data.val_mask].detach().cpu(), 'y_pred': scores[data.val_mask].detach().cpu()})['rocauc']
+        test_score = evaluator.eval({'y_true': data.y[data.test_mask].detach().cpu(), 'y_pred': scores[data.test_mask].detach().cpu()})['rocauc']
+        return (train_score, val_score, test_score, pred_eval)
+
     pred = pred_eval.argmax(dim=1)
-    train_acc = (pred[data.train_mask] == data.y[data.train_mask]).float().mean().item()
-    val_acc = (pred[data.val_mask] == data.y[data.val_mask]).float().mean().item()
-    test_acc = (pred[data.test_mask] == data.y[data.test_mask]).float().mean().item()
+    if hasattr(data, 'ogb_name') and data.ogb_name in ['ogbn-arxiv', 'ogbn-mag']:
+        evaluator = Evaluator(name=data.ogb_name)
+        y_true = data.y.view(-1, 1)
+        y_pred = pred.view(-1, 1)
+        train_acc = evaluator.eval({'y_true': y_true[data.train_mask].detach().cpu(), 'y_pred': y_pred[data.train_mask].detach().cpu()})['acc']
+        val_acc = evaluator.eval({'y_true': y_true[data.val_mask].detach().cpu(), 'y_pred': y_pred[data.val_mask].detach().cpu()})['acc']
+        test_acc = evaluator.eval({'y_true': y_true[data.test_mask].detach().cpu(), 'y_pred': y_pred[data.test_mask].detach().cpu()})['acc']
+    else:
+        train_acc = (pred[data.train_mask] == data.y[data.train_mask]).float().mean().item()
+        val_acc = (pred[data.val_mask] == data.y[data.val_mask]).float().mean().item()
+        test_acc = (pred[data.test_mask] == data.y[data.test_mask]).float().mean().item()
     return (train_acc, val_acc, test_acc, pred_eval)
 
 def train_main() -> None:
     parser = argparse.ArgumentParser(description='ASCii: Adaptive Gauge-Invariant Self-Interference Control')
-    parser.add_argument('data', type=int, help='0=Cora,1=Citeseer,2=Pubmed,3=Chameleon,4=Squirrel,5=Actor,6=Cornell,7=Texas,else=Wisconsin')
+    parser.add_argument('data', type=int, help='0=Cora,1=Citeseer,2=Pubmed,3=Chameleon,4=Squirrel,5=Actor,6=Cornell,7=Texas,8/9=Wisconsin,10=ogbn-arxiv,11=ogbn-proteins,12=ogbn-mag')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--epochs', type=int, default=1000)
@@ -452,7 +594,9 @@ def train_main() -> None:
         appnp = APPNP(K=args.preprop_K, alpha=args.preprop_alpha, dropout=args.preprop_dropout).to(device)
         with torch.no_grad():
             data.x = appnp(data.x, data.edge_index)
-    model = ASCiiNet(in_dim=dataset.num_node_features, hidden_dim=args.hidden, num_classes=dataset.num_classes, edge_index=data.edge_index, num_nodes=data.num_nodes, num_heads=args.heads, gamma=args.gamma, attn_dropout=args.attn_dropout, feat_dropout=args.feat_dropout, readout_dropout=args.readout_dropout, layers=args.layers, eta_max=args.eta_max, eta_bar=args.eta_bar, lambda_attn=args.lambda_attn, alpha_skip=args.alpha_skip, jk_mode=args.jk, readout_rank=args.readout_rank, readout_hidden=args.readout_hidden, use_nodenorm=args.use_nodenorm, use_phase=args.use_phase, phase_scale=args.phase_scale).to(device)
+    in_dim = infer_num_node_features(dataset, data)
+    num_classes = infer_num_classes(dataset, data)
+    model = ASCiiNet(in_dim=in_dim, hidden_dim=args.hidden, num_classes=num_classes, edge_index=data.edge_index, num_nodes=data.num_nodes, num_heads=args.heads, gamma=args.gamma, attn_dropout=args.attn_dropout, feat_dropout=args.feat_dropout, readout_dropout=args.readout_dropout, layers=args.layers, eta_max=args.eta_max, eta_bar=args.eta_bar, lambda_attn=args.lambda_attn, alpha_skip=args.alpha_skip, jk_mode=args.jk, readout_rank=args.readout_rank, readout_hidden=args.readout_hidden, use_nodenorm=args.use_nodenorm, use_phase=args.use_phase, phase_scale=args.phase_scale).to(device)
     model.prepare_static_graph(data.x, data.edge_index)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_lr_scale)
@@ -461,14 +605,16 @@ def train_main() -> None:
     best_epoch = 0
     best_state = None
     bad = 0
+    metric_label = 'ROC-AUC' if getattr(data, 'eval_metric', 'acc') == 'rocauc' else 'Acc'
     for epoch in tqdm(range(1, args.epochs + 1)):
         model.train()
         ei1 = dropedge(data.edge_index, args.dropedge, training=True)
         ei2 = dropedge(data.edge_index, args.dropedge, training=True)
         logits1, eta_loss1 = model(data.x, edge_index_override=ei1, return_aux=True)
         logits2, eta_loss2 = model(data.x, edge_index_override=ei2, return_aux=True)
-        ce = cross_entropy_with_label_smoothing(logits1[data.train_mask], data.y[data.train_mask], smoothing=args.label_smooth)
-        cons = js_consistency(logits1, logits2.detach(), T=args.cons_T)
+        task_type = getattr(data, 'task_type', 'multiclass')
+        ce = supervised_loss(logits1, data.y, data.train_mask, task_type, label_smooth=args.label_smooth)
+        cons = prediction_consistency(logits1, logits2.detach(), task_type, T=args.cons_T)
         eta_loss = 0.5 * (eta_loss1 + eta_loss2)
         loss = ce + args.consistency_w * cons + args.eta_reg * eta_loss
         if epoch <= args.warmup:
@@ -506,7 +652,7 @@ def train_main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
     final_train_acc, final_val_acc, final_test_acc, _ = evaluate(model, data, args)
-    print(f'Best Val Acc={best_val_acc:.4f}, Test Acc@BestVal={test_acc_at_best_val:.4f}, Best Epoch={best_epoch}')
+    print(f'Best Val {metric_label}={best_val_acc:.4f}, Test {metric_label}@BestVal={test_acc_at_best_val:.4f}, Best Epoch={best_epoch}')
     print(f'Loaded Best-Val State: train={final_train_acc:.4f}, val={final_val_acc:.4f}, test={final_test_acc:.4f}')
 if __name__ == '__main__':
     train_main()
