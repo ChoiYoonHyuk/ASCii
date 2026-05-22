@@ -1,9 +1,3 @@
-# Auto-generated unified file from the two uploaded code snippets.
-# Run examples:
-#   python unified_getsic_ascii_cost.py --impl getsic 9 --epochs 5
-#   python unified_getsic_ascii_cost.py --impl ascii 9 --epochs 5
-#   python unified_getsic_ascii_cost.py --impl both 0 --epochs 5
-
 import argparse
 import copy
 import gc
@@ -17,7 +11,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.data import Data
-
 try:
     from torch_geometric.loader import NeighborLoader
 except ImportError:
@@ -27,16 +20,12 @@ from torch_geometric.nn import APPNP, LabelPropagation
 from torch_geometric.nn.models import CorrectAndSmooth
 from torch_geometric.utils import add_remaining_self_loops, degree, remove_self_loops, softmax, to_undirected
 from tqdm import tqdm
-
 try:
     from ogb.nodeproppred import Evaluator, PygNodePropPredDataset
 except ImportError:
     Evaluator = None
     PygNodePropPredDataset = None
 
-
-
-# --- First-code GETSIC implementation, with OGB support supplied by the shared loader below. ---
 def nan_to_num_safe(x: Tensor, nan=0.0, posinf=0.0, neginf=0.0) -> Tensor:
     if torch.is_complex(x):
         xr = torch.view_as_real(x)
@@ -44,7 +33,6 @@ def nan_to_num_safe(x: Tensor, nan=0.0, posinf=0.0, neginf=0.0) -> Tensor:
         return torch.view_as_complex(xr)
     else:
         return torch.nan_to_num(x, nan=nan, posinf=posinf, neginf=neginf)
-
 
 def cross_entropy_with_label_smoothing(pred, target, smoothing=0.0):
     if smoothing <= 0.0:
@@ -57,33 +45,29 @@ def cross_entropy_with_label_smoothing(pred, target, smoothing=0.0):
         true_dist.scatter_(1, target.data.unsqueeze(1), 1.0 - smoothing)
     return torch.mean(torch.sum(-true_dist * log_probs, dim=1))
 
-
 def dropedge(edge_index: Tensor, p: float, training: bool) -> Tensor:
-    if p <= 0.0 or (not training): return edge_index
+    if p <= 0.0 or not training:
+        return edge_index
     E = edge_index.size(1)
     keep = torch.rand(E, device=edge_index.device) > p
     return edge_index[:, keep]
 
-
-def js_consistency(logits1: Tensor, logits2_detached: Tensor, T: float = 2.0) -> Tensor:
+def js_consistency(logits1: Tensor, logits2_detached: Tensor, T: float=2.0) -> Tensor:
     p1 = F.softmax(logits1 / T, dim=-1)
     p2 = F.softmax(logits2_detached / T, dim=-1)
     m = 0.5 * (p1 + p2)
-    js = 0.5 * (
-        F.kl_div((p1 + 1e-12).log(), m, reduction='batchmean') +
-        F.kl_div((p2 + 1e-12).log(), m, reduction='batchmean')
-    )
-    return (T * T) * js
+    js = 0.5 * (F.kl_div((p1 + 1e-12).log(), m, reduction='batchmean') + F.kl_div((p2 + 1e-12).log(), m, reduction='batchmean'))
+    return T * T * js
 
-
-def complex_linear(x: Tensor, W: Tensor, b: Optional[Tensor] = None) -> Tensor:
+def complex_linear(x: Tensor, W: Tensor, b: Optional[Tensor]=None) -> Tensor:
     y = x @ W.transpose(0, 1)
-    if b is not None: y = y + b
+    if b is not None:
+        y = y + b
     return y
 
-
 class ComplexLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, dtype=torch.cfloat):
+
+    def __init__(self, in_features: int, out_features: int, bias: bool=True, dtype=torch.cfloat):
         super().__init__()
         self.W = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
         self.bias = nn.Parameter(torch.empty(out_features, dtype=dtype)) if bias else None
@@ -103,22 +87,22 @@ class ComplexLinear(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return complex_linear(x, self.W, self.bias)
 
-
 class ModReLU(nn.Module):
+
     def __init__(self, features: int):
         super().__init__()
         self.b = nn.Parameter(torch.zeros(features, dtype=torch.float))
 
     def forward(self, z: Tensor) -> Tensor:
         mag = torch.abs(z)
-        mag = torch.clamp(mag, min=1e-6)
+        mag = torch.clamp(mag, min=1e-06)
         gated = F.relu(mag + self.b)
         out = gated * (z / mag)
         return nan_to_num_safe(out)
 
-
 class NodeNorm(nn.Module):
-    def __init__(self, eps: float = 1e-5):
+
+    def __init__(self, eps: float=1e-05):
         super().__init__()
         self.eps = eps
 
@@ -137,11 +121,9 @@ class NodeNorm(nn.Module):
             out = (x - mean) / std
             return torch.nan_to_num(out)
 
-
 class GETSICSoftmaxLayer(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 4,
-                 gamma: float = 1.0, use_bias: bool = False, attn_dropout: float = 0.5,
-                 use_activation: bool = True, use_nodenorm: bool = True):
+
+    def __init__(self, dim: int, num_heads: int=4, gamma: float=1.0, use_bias: bool=False, attn_dropout: float=0.5, use_activation: bool=True, use_nodenorm: bool=True):
         super().__init__()
         self.in_dim = dim
         self.out_dim = dim
@@ -159,13 +141,13 @@ class GETSICSoftmaxLayer(nn.Module):
     def msg_gate(self):
         return torch.sigmoid(self._msg_gate)
 
-    def forward(self, h: Tensor, edge_index: Tensor, sic_strength: float = 0.0) -> Tensor:
+    def forward(self, h: Tensor, edge_index: Tensor, sic_strength: float=0.0) -> Tensor:
         src, dst = edge_index
         N = h.size(0)
         h_src_in = h[src]
         h_dst_in = h[dst]
-        h_dst_norm2 = (h_dst_in.real**2 + h_dst_in.imag**2).sum(dim=1, keepdim=True)
-        h_dst_norm2 = torch.clamp(h_dst_norm2, min=1e-6)
+        h_dst_norm2 = (h_dst_in.real ** 2 + h_dst_in.imag ** 2).sum(dim=1, keepdim=True)
+        h_dst_norm2 = torch.clamp(h_dst_norm2, min=1e-06)
         updates_sum = torch.zeros((N, self.out_dim), dtype=torch.cfloat, device=h.device)
         gate = self.msg_gate
         for m in range(self.M):
@@ -185,16 +167,14 @@ class GETSICSoftmaxLayer(nn.Module):
             alpha = softmax(logits, dst, num_nodes=N)
             alpha = torch.nan_to_num(alpha)
             alpha = F.dropout(alpha, p=self.attn_dropout, training=self.training)
-            
             base = gate * r_attn + (1.0 - gate) * transported
             with torch.no_grad():
                 sim = F.cosine_similarity(h_src_in.real, h_dst_in.real, dim=-1).clamp(min=-1.0, max=1.0)
-                sign = torch.sign(sim)  # -1, 0, +1
+                sign = torch.sign(sim)
             sign = sign.to(base.dtype).unsqueeze(-1)
             base = base * (0.5 + 0.5 * sign)
-            
             base = nan_to_num_safe(base)
-            msg = (alpha.unsqueeze(-1).to(base.dtype)) * base
+            msg = alpha.unsqueeze(-1).to(base.dtype) * base
             msg = nan_to_num_safe(msg)
             updates_sum.index_add_(0, dst, msg)
         h_new = h + updates_sum
@@ -203,14 +183,11 @@ class GETSICSoftmaxLayer(nn.Module):
         h_next = self.act(h_new)
         return h_next
 
-
 class GETSICSoftmaxNet(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, edge_index: Tensor, num_nodes: int,
-                 num_heads: int = 4, gamma: float = 1.0, attn_dropout: float = 0.5,
-                 feat_dropout: float = 0.5, layers: int = 3, sic_first: float = 0.5,
-                 alpha_skip: float = 0.1, jk_mode: str = "concat", use_nodenorm: bool = True):
+
+    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, edge_index: Tensor, num_nodes: int, num_heads: int=4, gamma: float=1.0, attn_dropout: float=0.5, feat_dropout: float=0.5, layers: int=3, sic_first: float=0.5, alpha_skip: float=0.1, jk_mode: str='concat', use_nodenorm: bool=True):
         super().__init__()
-        assert jk_mode in ["concat", "mean"]
+        assert jk_mode in ['concat', 'mean']
         self.edge_index = edge_index
         self.num_nodes = num_nodes
         self.num_classes = num_classes
@@ -219,14 +196,9 @@ class GETSICSoftmaxNet(nn.Module):
         self.layers_num = layers
         self.jk_mode = jk_mode
         self.enc = ComplexLinear(in_dim, hidden_dim, bias=True)
-        self.layers = nn.ModuleList([
-            GETSICSoftmaxLayer(hidden_dim, num_heads=num_heads, gamma=gamma,
-                               attn_dropout=attn_dropout, use_activation=(i < layers-1),
-                               use_nodenorm=use_nodenorm)
-            for i in range(layers)
-        ])
-        self.sic_vals = [sic_first] + [0.0]*(layers-1)
-        if jk_mode == "concat":
+        self.layers = nn.ModuleList([GETSICSoftmaxLayer(hidden_dim, num_heads=num_heads, gamma=gamma, attn_dropout=attn_dropout, use_activation=i < layers - 1, use_nodenorm=use_nodenorm) for i in range(layers)])
+        self.sic_vals = [sic_first] + [0.0] * (layers - 1)
+        if jk_mode == 'concat':
             cls_in = hidden_dim * 2 * layers
         else:
             cls_in = hidden_dim * 2
@@ -245,7 +217,7 @@ class GETSICSoftmaxNet(nn.Module):
             h_new = layer(h, ei, sic_strength=self.sic_vals[i])
             h = (1.0 - self.alpha_skip) * h_new + self.alpha_skip * h0
             hs.append(h)
-        h_out = torch.cat(hs, dim=-1) if self.jk_mode == "concat" else torch.stack(hs, dim=0).mean(dim=0)
+        h_out = torch.cat(hs, dim=-1) if self.jk_mode == 'concat' else torch.stack(hs, dim=0).mean(dim=0)
         z = torch.view_as_real(h_out)
         z = z.reshape(z.size(0), -1)
         z = self.cls_norm(z)
@@ -253,9 +225,6 @@ class GETSICSoftmaxNet(nn.Module):
         logits = self.cls(z)
         return logits
 
-
-
-# --- Second-code ASCii/GESC implementation and shared OGB utilities. ---
 def nan_to_num_safe(x: Tensor, nan: float=0.0, posinf: float=0.0, neginf: float=0.0) -> Tensor:
     if torch.is_complex(x):
         xr = torch.view_as_real(x)
@@ -300,14 +269,11 @@ def set_if_unprovided(args, provided: set, name: str, value) -> None:
     if name not in provided:
         setattr(args, name, value)
 
-
-
 def set_seed(seed: int) -> None:
     random.seed(int(seed))
     torch.manual_seed(int(seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(seed))
-    # Keep this deterministic enough for Planetoid/Cora comparisons.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -379,17 +345,9 @@ class PhasePreservingNodeNorm(nn.Module):
         var = (x - mean).square().mean(dim=-1, keepdim=True)
         return torch.nan_to_num((x - mean) * torch.rsqrt(var + self.eps))
 
-
-
 class LegacyNodeNorm(nn.Module):
-    """Node-wise normalization used by the non-adaptive GESC baseline.
 
-    This intentionally differs from PhasePreservingNodeNorm: it normalizes the
-    real/imaginary channels over feature dimensions per node, matching the
-    attached non-adaptive GESC implementation.
-    """
-
-    def __init__(self, eps: float = 1e-5):
+    def __init__(self, eps: float=1e-05):
         super().__init__()
         self.eps = eps
 
@@ -404,25 +362,9 @@ class LegacyNodeNorm(nn.Module):
         std = x.std(dim=-1, keepdim=True).clamp_min(self.eps)
         return torch.nan_to_num((x - mean) / std)
 
-
 class GESCSoftmaxLayer(nn.Module):
-    """Non-adaptive GESC/GET-SIC layer from the attached strong baseline.
 
-    The key difference from ASCiiLayer is that the SIC coefficient is fixed
-    per layer (`sic_strength`) instead of being edge-adaptive. This is useful
-    for Cora, where the simpler baseline was reported to work better.
-    """
-
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 4,
-        gamma: float = 1.0,
-        use_bias: bool = False,
-        attn_dropout: float = 0.5,
-        use_activation: bool = True,
-        use_nodenorm: bool = True,
-    ):
+    def __init__(self, dim: int, num_heads: int=4, gamma: float=1.0, use_bias: bool=False, attn_dropout: float=0.5, use_activation: bool=True, use_nodenorm: bool=True):
         super().__init__()
         self.in_dim = dim
         self.out_dim = dim
@@ -440,31 +382,26 @@ class GESCSoftmaxLayer(nn.Module):
     def msg_gate(self) -> Tensor:
         return torch.sigmoid(self._msg_gate)
 
-    def forward(self, h: Tensor, edge_index: Tensor, sic_strength: float = 0.0) -> Tensor:
+    def forward(self, h: Tensor, edge_index: Tensor, sic_strength: float=0.0) -> Tensor:
         if edge_index.numel() == 0:
             return self.act(self.nodenorm(h))
-
         src, dst = edge_index
         N = h.size(0)
         h_src_in = h[src]
         h_dst_in = h[dst]
         h_dst_norm2 = (h_dst_in.real.square() + h_dst_in.imag.square()).sum(dim=1, keepdim=True)
-        h_dst_norm2 = h_dst_norm2.clamp_min(1e-6)
+        h_dst_norm2 = h_dst_norm2.clamp_min(1e-06)
         updates_sum = torch.zeros((N, self.out_dim), dtype=torch.cfloat, device=h.device)
         gate = self.msg_gate
-
         for m in range(self.M):
             Wh_src = self.W[m](h_src_in)
             transported = nan_to_num_safe(Wh_src)
-
             hi_conj_dot = torch.sum(torch.conj(h_dst_in) * transported, dim=1, keepdim=True)
             hi_conj_dot = nan_to_num_safe(hi_conj_dot)
             proj = h_dst_in * (hi_conj_dot / h_dst_norm2)
             proj = nan_to_num_safe(proj)
-
             r_attn = transported - float(sic_strength) * proj
             r_attn = nan_to_num_safe(r_attn)
-
             Qhi = nan_to_num_safe(self.Q[m](h_dst_in))
             s = torch.sum(torch.conj(Qhi) * r_attn, dim=1)
             s = nan_to_num_safe(s)
@@ -473,49 +410,25 @@ class GESCSoftmaxLayer(nn.Module):
             alpha = softmax(logits, dst, num_nodes=N)
             alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
             alpha = F.dropout(alpha, p=self.attn_dropout, training=self.training)
-
             base = gate.to(transported.dtype) * r_attn + (1.0 - gate).to(transported.dtype) * transported
             with torch.no_grad():
                 sim = F.cosine_similarity(h_src_in.real, h_dst_in.real, dim=-1).clamp(min=-1.0, max=1.0)
                 sign = torch.sign(sim)
             base = base * (0.5 + 0.5 * sign.to(base.dtype).unsqueeze(-1))
-
             base = nan_to_num_safe(base)
             msg = alpha.unsqueeze(-1).to(base.dtype) * base
             msg = nan_to_num_safe(msg)
             updates_sum.index_add_(0, dst, msg)
-
         h_new = h + updates_sum
         h_new = nan_to_num_safe(h_new)
         h_new = self.nodenorm(h_new)
         return self.act(h_new)
 
-
 class GESCSoftmaxNet(nn.Module):
-    """Full non-adaptive GESC baseline, adapted to the ASCii training API."""
 
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        num_classes: int,
-        edge_index: Tensor,
-        num_nodes: int,
-        num_heads: int = 4,
-        gamma: float = 0.1,
-        attn_dropout: float = 0.2,
-        feat_dropout: float = 0.5,
-        readout_dropout: float = 0.5,
-        layers: int = 2,
-        sic_first: float = 1.5,
-        alpha_skip: float = 0.1,
-        jk_mode: str = 'concat',
-        use_nodenorm: bool = True,
-    ):
+    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, edge_index: Tensor, num_nodes: int, num_heads: int=4, gamma: float=0.1, attn_dropout: float=0.2, feat_dropout: float=0.5, readout_dropout: float=0.5, layers: int=2, sic_first: float=1.5, alpha_skip: float=0.1, jk_mode: str='concat', use_nodenorm: bool=True):
         super().__init__()
         if jk_mode == 'last':
-            # The legacy baseline only had concat/mean. Map last to mean rather
-            # than failing in sweeps that reuse ASCii CLI options.
             jk_mode = 'mean'
         assert jk_mode in ['concat', 'mean']
         self.edge_index = edge_index
@@ -526,17 +439,7 @@ class GESCSoftmaxNet(nn.Module):
         self.layers_num = layers
         self.jk_mode = jk_mode
         self.enc = ComplexLinear(in_dim, hidden_dim, bias=True)
-        self.layers = nn.ModuleList([
-            GESCSoftmaxLayer(
-                hidden_dim,
-                num_heads=num_heads,
-                gamma=gamma,
-                attn_dropout=attn_dropout,
-                use_activation=(i < layers - 1),
-                use_nodenorm=use_nodenorm,
-            )
-            for i in range(layers)
-        ])
+        self.layers = nn.ModuleList([GESCSoftmaxLayer(hidden_dim, num_heads=num_heads, gamma=gamma, attn_dropout=attn_dropout, use_activation=i < layers - 1, use_nodenorm=use_nodenorm) for i in range(layers)])
         self.sic_vals = [float(sic_first)] + [0.0] * max(0, layers - 1)
         cls_in = hidden_dim * 2 * layers if jk_mode == 'concat' else hidden_dim * 2
         self.cls_norm = nn.LayerNorm(cls_in)
@@ -544,13 +447,7 @@ class GESCSoftmaxNet(nn.Module):
         self.cls = nn.Linear(cls_in, num_classes)
         self.last_homo_logits = None
 
-    def forward(
-        self,
-        x_real: Tensor,
-        edge_index_override: Optional[Tensor] = None,
-        return_aux: bool = False,
-        recompute_static: bool = False,
-    ):
+    def forward(self, x_real: Tensor, edge_index_override: Optional[Tensor]=None, return_aux: bool=False, recompute_static: bool=False):
         del recompute_static
         self.last_homo_logits = None
         x_real = self.feat_drop(torch.nan_to_num(x_real.float(), nan=0.0, posinf=0.0, neginf=0.0))
@@ -569,9 +466,8 @@ class GESCSoftmaxNet(nn.Module):
         z = self.cls_drop(z)
         logits = self.cls(z)
         if return_aux:
-            return logits, logits.new_tensor(0.0)
+            return (logits, logits.new_tensor(0.0))
         return logits
-
 
 @torch.no_grad()
 def normalize_feature_view(x: Tensor, eps: float=1e-12) -> Tensor:
@@ -588,7 +484,7 @@ def normalize_homophily_block(x: Tensor, mode: str, eps: float=1e-12) -> Tensor:
         mean = x.mean(dim=0, keepdim=True)
         std = x.std(dim=0, keepdim=True).clamp_min(eps)
         return torch.nan_to_num((x - mean) / std, nan=0.0, posinf=0.0, neginf=0.0)
-    raise ValueError("homo_feature_norm must be one of: none, row, column")
+    raise ValueError('homo_feature_norm must be one of: none, row, column')
 
 @torch.no_grad()
 def build_homophilic_features(x: Tensor, edge_index: Tensor, K: int=10, alpha: float=0.1, dropout: float=0.0, mode: str='cat', norm: str='none') -> Tensor:
@@ -608,19 +504,17 @@ def build_homophilic_features(x: Tensor, edge_index: Tensor, K: int=10, alpha: f
     elif mode == 'cat_diff':
         out = torch.cat([x0n, xpn, normalize_homophily_block(xp - x0, norm)], dim=-1)
     else:
-        raise ValueError("homo_feature_mode must be one of: off, prop, cat, cat_diff")
+        raise ValueError('homo_feature_mode must be one of: off, prop, cat, cat_diff')
     return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).to(x.dtype)
 
 @torch.no_grad()
-def compute_local_inconsistency(u: Tensor, edge_index: Tensor, num_nodes: int, eps: float=1e-12, edge_chunk_size: int=500000) -> Tensor:
+def compute_local_inconsistency(u: Tensor, edge_index: Tensor, num_nodes: int, eps: float=1e-12, edge_chunk_size: int=0) -> Tensor:
     clean_edge_index, _ = remove_self_loops(edge_index)
     if clean_edge_index.numel() == 0:
         return torch.zeros(num_nodes, device=u.device, dtype=torch.float)
-
     u_norm = F.normalize(u.float(), p=2, dim=-1, eps=eps)
     acc = torch.zeros(num_nodes, device=u.device, dtype=torch.float)
     cnt = torch.zeros(num_nodes, device=u.device, dtype=torch.float)
-
     E = clean_edge_index.size(1)
     chunk = int(edge_chunk_size) if edge_chunk_size and edge_chunk_size > 0 else E
     for start in range(0, E, chunk):
@@ -630,7 +524,6 @@ def compute_local_inconsistency(u: Tensor, edge_index: Tensor, num_nodes: int, e
         sim = (u_norm[src] * u_norm[dst]).sum(dim=-1).clamp(min=-1.0, max=1.0)
         acc.index_add_(0, dst, sim)
         cnt.index_add_(0, dst, torch.ones_like(sim))
-
     avg = acc / cnt.clamp_min(1.0)
     q = (1.0 - avg).clamp(min=0.0, max=2.0)
     q = torch.where(cnt > 0, q, torch.zeros_like(q))
@@ -638,7 +531,7 @@ def compute_local_inconsistency(u: Tensor, edge_index: Tensor, num_nodes: int, e
 
 class ASCiiLayer(nn.Module):
 
-    def __init__(self, dim: int, num_heads: int=4, gamma: float=1.0, attn_dropout: float=0.2, eta_max: float=0.75, eta_bar: float=0.5, lambda_attn: float=0.5, layer_id: int=0, num_layers: int=1, use_activation: bool=True, use_nodenorm: bool=True, use_phase: bool=True, phase_scale: float=1.0, eps: float=1e-08, edge_chunk_size: int=200000, attn_mode: str='softmax'):
+    def __init__(self, dim: int, num_heads: int=4, gamma: float=1.0, attn_dropout: float=0.2, eta_max: float=0.75, eta_bar: float=0.5, lambda_attn: float=0.5, layer_id: int=0, num_layers: int=1, use_activation: bool=True, use_nodenorm: bool=True, use_phase: bool=True, phase_scale: float=1.0, eps: float=1e-08, edge_chunk_size: int=0, attn_mode: str='softmax'):
         super().__init__()
         self.in_dim = dim
         self.out_dim = dim
@@ -657,7 +550,7 @@ class ASCiiLayer(nn.Module):
         self.edge_chunk_size = int(edge_chunk_size) if edge_chunk_size is not None else 0
         self.attn_mode = str(attn_mode)
         if self.attn_mode not in ['softmax', 'sigmoid_degree', 'degree']:
-            raise ValueError("attn_mode must be one of: softmax, sigmoid_degree, degree")
+            raise ValueError('attn_mode must be one of: softmax, sigmoid_degree, degree')
         self.W = nn.ModuleList([ComplexLinear(dim, dim, bias=False) for _ in range(self.M)])
         self.Q = nn.ModuleList([ComplexLinear(dim, dim, bias=False) for _ in range(self.M)])
         desc_dim = 7
@@ -676,7 +569,7 @@ class ASCiiLayer(nn.Module):
             nn.init.xavier_uniform_(lin.weight)
             nn.init.zeros_(lin.bias)
 
-    def _edge_static_terms(self, edge_index: Tensor, x_view: Tensor, degree_log: Tensor, q_hat: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    def _edge_static_terms(self, edge_index: Tensor, x_view: Tensor, degree_log: Tensor, q_hat: Tensor) -> Tensor:
         src, dst = edge_index
         delta_x = 1.0 - (x_view[dst] * x_view[src]).sum(dim=-1, keepdim=True)
         delta_x = delta_x.clamp(min=0.0, max=2.0)
@@ -684,162 +577,167 @@ class ASCiiLayer(nn.Module):
         qi = q_hat[dst].unsqueeze(-1)
         qj = q_hat[src].unsqueeze(-1)
         layer_frac = torch.full_like(delta_x, self.layer_frac)
-        return (delta_x, delta_d, qi, qj, layer_frac)
+        return torch.cat([delta_x, delta_d, qi, qj, layer_frac], dim=-1)
 
-    def _compute_edge_terms(self, h: Tensor, edge_index: Tensor, x_view: Tensor, degree_log: Tensor, q_hat: Tensor, head_id: int) -> Tuple[Tensor, Tensor, Tensor]:
+    def _complex_norm2(self, x: Tensor) -> Tensor:
+        return (x.real.square() + x.imag.square()).sum(dim=-1, keepdim=True)
+
+    def _stack_complex_weight(self, modules: nn.ModuleList) -> Tensor:
+        return torch.stack([mod.W for mod in modules], dim=0)
+
+    def _linear_all_heads(self, x: Tensor, modules: nn.ModuleList) -> Tensor:
+        weight = self._stack_complex_weight(modules)
+        return torch.einsum('ed,mod->emo', x, weight)
+
+    def _stack_linear_weight_bias(self, modules: nn.ModuleList) -> Tuple[Tensor, Tensor]:
+        weight = torch.stack([mod.weight.squeeze(0) for mod in modules], dim=0)
+        bias = torch.stack([mod.bias.squeeze(0) for mod in modules], dim=0)
+        return (weight, bias)
+
+    def _head_linear_scalar(self, z: Tensor, modules: nn.ModuleList) -> Tensor:
+        weight, bias = self._stack_linear_weight_bias(modules)
+        return torch.einsum('emk,mk->em', z, weight) + bias.unsqueeze(0)
+
+    def _group_softmax_2d(self, logits: Tensor, dst: Tensor, num_nodes: int) -> Tensor:
+        if logits.numel() == 0:
+            return logits
+        N = int(num_nodes)
+        M = logits.size(1)
+        if hasattr(torch.Tensor, 'scatter_reduce_'):
+            max_per_dst = torch.full((N, M), -torch.inf, dtype=logits.dtype, device=logits.device)
+            with torch.no_grad():
+                max_per_dst.scatter_reduce_(0, dst.view(-1, 1).expand(-1, M), logits.detach(), reduce='amax', include_self=True)
+            shifted = (logits - max_per_dst[dst]).clamp(min=-80.0, max=80.0)
+            expv = torch.exp(shifted)
+            denom = torch.zeros((N, M), dtype=logits.dtype, device=logits.device)
+            denom.index_add_(0, dst, expv)
+            return expv / denom[dst].clamp_min(self.eps)
+        outs = []
+        for m in range(M):
+            outs.append(softmax(logits[:, m], dst, num_nodes=N))
+        return torch.stack(outs, dim=1)
+
+    def _compute_edge_terms_all(self, h: Tensor, edge_index: Tensor, edge_static: Tensor, need_logits: bool=True) -> Tuple[Optional[Tensor], Tensor, Tensor]:
         src, dst = edge_index
         h_src = h[src]
         h_dst = h[dst]
-        delta_x, delta_d, qi, qj, layer_frac = self._edge_static_terms(edge_index=edge_index, x_view=x_view, degree_log=degree_log, q_hat=q_hat)
-        phase_desc = torch.cat([delta_x, delta_d, qi, qj, layer_frac], dim=-1)
-
-        Wh_src = nan_to_num_safe(self.W[head_id](h_src))
+        static = edge_static.to(dtype=h.real.dtype, device=h.device)
+        Wh_src = self._linear_all_heads(h_src, self.W)
         if self.use_phase:
-            theta = math.pi * self.phase_scale * torch.tanh(self.phase_nets[head_id](phase_desc))
-            U = torch.complex(torch.cos(theta), torch.sin(theta))
+            phase_w, phase_b = self._stack_linear_weight_bias(self.phase_nets)
+            theta = math.pi * self.phase_scale * torch.tanh(static @ phase_w.transpose(0, 1) + phase_b.unsqueeze(0))
+            U = torch.complex(torch.cos(theta), torch.sin(theta)).unsqueeze(-1)
             transported = Wh_src * U
         else:
             transported = Wh_src
         transported = nan_to_num_safe(transported)
-
-        Qhi = nan_to_num_safe(self.Q[head_id](h_dst))
-        s = torch.sum(torch.conj(Qhi) * transported, dim=1, keepdim=True)
+        Qhi = nan_to_num_safe(self._linear_all_heads(h_dst, self.Q))
+        s = torch.sum(torch.conj(Qhi) * transported, dim=-1, keepdim=True)
         s = nan_to_num_safe(s)
-        nu = torch.linalg.vector_norm(Qhi, dim=-1, keepdim=True) * torch.linalg.vector_norm(transported, dim=-1, keepdim=True) + self.eps
-        rho = torch.real(s) / nu
-        chi = torch.abs(s) / nu
-        rho = torch.nan_to_num(rho, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=-1.0, max=1.0)
-        chi = torch.nan_to_num(chi, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0, max=1.0)
-
-        z = torch.cat([rho, chi, delta_x, delta_d, qi, qj, layer_frac], dim=-1)
-        eta = self.eta_max * torch.sigmoid(self.eta_nets[head_id](z))
+        q_norm2 = self._complex_norm2(Qhi).clamp_min(self.eps)
+        t_norm2 = self._complex_norm2(transported).clamp_min(self.eps)
+        nu = torch.sqrt(q_norm2 * t_norm2).clamp_min(self.eps)
+        rho = (torch.real(s) / nu).clamp(min=-1.0, max=1.0)
+        chi = (torch.abs(s) / nu).clamp(min=0.0, max=1.0)
+        rho = torch.nan_to_num(rho, nan=0.0, posinf=0.0, neginf=0.0)
+        chi = torch.nan_to_num(chi, nan=0.0, posinf=0.0, neginf=0.0)
+        static_expand = static.unsqueeze(1).expand(-1, self.M, -1)
+        z = torch.cat([rho, chi, static_expand], dim=-1)
+        eta = self.eta_max * torch.sigmoid(self._head_linear_scalar(z, self.eta_nets)).unsqueeze(-1)
         eta = torch.nan_to_num(eta, nan=0.0, posinf=self.eta_max, neginf=0.0)
         eta_penalty = (eta - self.eta_bar).square().mean()
-
-        h_dst_norm2 = (h_dst.real.square() + h_dst.imag.square()).sum(dim=1, keepdim=True)
-        h_dst_norm2 = h_dst_norm2.clamp_min(self.eps)
-        hi_conj_dot = torch.sum(torch.conj(h_dst) * transported, dim=1, keepdim=True)
+        h_dst_view = h_dst.unsqueeze(1)
+        h_dst_norm2 = self._complex_norm2(h_dst).clamp_min(self.eps).unsqueeze(1)
+        hi_conj_dot = torch.sum(torch.conj(h_dst_view) * transported, dim=-1, keepdim=True)
         hi_conj_dot = nan_to_num_safe(hi_conj_dot)
-        proj = h_dst * (hi_conj_dot / h_dst_norm2)
+        proj = h_dst_view * (hi_conj_dot / h_dst_norm2)
         proj = nan_to_num_safe(proj)
-
         r = transported - eta.to(transported.dtype) * proj
         r = nan_to_num_safe(r)
-
-        s_r = torch.sum(torch.conj(Qhi) * r, dim=1, keepdim=True)
-        denom_r = torch.linalg.vector_norm(Qhi, dim=-1, keepdim=True) * torch.linalg.vector_norm(r, dim=-1, keepdim=True) + self.eps
-        rho_r = torch.real(s_r) / denom_r
-        rho_r = torch.nan_to_num(rho_r, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=-1.0, max=1.0)
-
-        xi = torch.sigmoid(self.xi_scale[head_id] * rho_r + self.xi_bias[head_id])
-        g = torch.sigmoid(self.mix_gate_nets[head_id](z))
+        s_r = torch.sum(torch.conj(Qhi) * r, dim=-1, keepdim=True)
+        r_norm2 = self._complex_norm2(r).clamp_min(self.eps)
+        denom_r = torch.sqrt(q_norm2 * r_norm2).clamp_min(self.eps)
+        rho_r = (torch.real(s_r) / denom_r).clamp(min=-1.0, max=1.0)
+        rho_r = torch.nan_to_num(rho_r, nan=0.0, posinf=0.0, neginf=0.0)
+        xi = torch.sigmoid(self.xi_scale.view(1, self.M, 1) * rho_r + self.xi_bias.view(1, self.M, 1))
+        g = torch.sigmoid(self._head_linear_scalar(z, self.mix_gate_nets)).unsqueeze(-1)
         msg_hat = g.to(r.dtype) * xi.to(r.dtype) * r + (1.0 - g).to(transported.dtype) * transported
         msg_hat = nan_to_num_safe(msg_hat)
+        logits = None
+        if need_logits:
+            s_tilde = torch.sum(torch.conj(Qhi) * msg_hat, dim=-1, keepdim=True)
+            msg_norm2 = self._complex_norm2(msg_hat).clamp_min(self.eps)
+            denom_hat = torch.sqrt(q_norm2 * msg_norm2).clamp_min(self.eps)
+            signed = torch.real(s_tilde) / denom_hat
+            strength = torch.abs(s_tilde) / math.sqrt(max(1, self.out_dim))
+            logits = self.gamma * (self.lambda_attn * strength + (1.0 - self.lambda_attn) * signed)
+            logits = torch.nan_to_num(logits.squeeze(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        return (logits, msg_hat, eta_penalty)
 
-        s_tilde = torch.sum(torch.conj(Qhi) * msg_hat, dim=1, keepdim=True)
-        denom_hat = torch.linalg.vector_norm(Qhi, dim=-1, keepdim=True) * torch.linalg.vector_norm(msg_hat, dim=-1, keepdim=True) + self.eps
-        signed = torch.real(s_tilde) / denom_hat
-        strength = torch.abs(s_tilde) / math.sqrt(max(1, self.out_dim))
-        logits = self.gamma * (self.lambda_attn * strength + (1.0 - self.lambda_attn) * signed)
-        logits = torch.nan_to_num(logits.squeeze(-1), nan=0.0, posinf=0.0, neginf=0.0)
-        return logits, msg_hat, eta_penalty
-
-    def _scatter_amax_(self, out: Tensor, index: Tensor, src: Tensor) -> None:
-        if hasattr(out, 'scatter_reduce_'):
-            out.scatter_reduce_(0, index, src, reduce='amax', include_self=True)
-        else:
-            for i, value in zip(index.tolist(), src.tolist()):
-                if value > out[i]:
-                    out[i] = value
+    def _add_messages(self, updates_heads: Tensor, dst: Tensor, alpha: Tensor, msg_hat: Tensor) -> None:
+        msg = alpha.unsqueeze(-1).to(msg_hat.dtype) * msg_hat
+        msg = nan_to_num_safe(msg)
+        updates_heads.index_add_(1, dst, msg.permute(1, 0, 2).contiguous())
 
     def forward(self, h: Tensor, edge_index: Tensor, x_view: Tensor, degree_log: Tensor, q_hat: Tensor, return_aux: bool=False):
         if edge_index.numel() == 0:
             h_next = self.act(self.nodenorm(h))
             zero = h.real.new_tensor(0.0)
             return (h_next, zero) if return_aux else h_next
-
         N = h.size(0)
         E = edge_index.size(1)
         chunk_size = self.edge_chunk_size if self.edge_chunk_size and self.edge_chunk_size > 0 else E
         chunk_size = max(1, int(chunk_size))
-        updates_sum = torch.zeros((N, self.out_dim), dtype=torch.cfloat, device=h.device)
-        eta_penalties = []
-
+        dst_all = edge_index[1]
+        edge_static = self._edge_static_terms(edge_index, x_view, degree_log, q_hat)
+        updates_heads = torch.zeros((self.M, N, self.out_dim), dtype=torch.cfloat, device=h.device)
+        eta_acc = h.real.new_tensor(0.0)
+        eta_weight = 0
         if self.attn_mode in ['degree', 'sigmoid_degree']:
-            dst_all = edge_index[1]
             deg_inv = degree(dst_all, num_nodes=N, dtype=h.real.dtype).clamp_min(1.0).reciprocal()
-            for m in range(self.M):
-                eta_weighted_sum = h.real.new_tensor(0.0)
-                eta_weight = 0
-                for start_i in range(0, E, chunk_size):
-                    end_i = min(start_i + chunk_size, E)
-                    ei_c = edge_index[:, start_i:end_i]
-                    dst_c = ei_c[1]
-                    logits_c, msg_hat_c, eta_penalty_c = self._compute_edge_terms(h, ei_c, x_view, degree_log, q_hat, m)
-                    if self.attn_mode == 'degree':
-                        alpha = deg_inv[dst_c]
-                    else:
-                        alpha = torch.sigmoid(logits_c) * deg_inv[dst_c]
-                    alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
-                    alpha = F.dropout(alpha, p=self.attn_dropout, training=self.training)
-                    msg = alpha.unsqueeze(-1).to(msg_hat_c.dtype) * msg_hat_c
-                    msg = nan_to_num_safe(msg)
-                    updates_sum.index_add_(0, dst_c, msg)
-                    eta_weighted_sum = eta_weighted_sum + eta_penalty_c * float(end_i - start_i)
-                    eta_weight += end_i - start_i
-                eta_penalties.append(eta_weighted_sum / max(1, eta_weight))
-        elif chunk_size >= E:
-            dst = edge_index[1]
-            for m in range(self.M):
-                logits, msg_hat, eta_penalty = self._compute_edge_terms(h, edge_index, x_view, degree_log, q_hat, m)
-                alpha = softmax(logits, dst, num_nodes=N)
+            need_logits = self.attn_mode == 'sigmoid_degree'
+            for start_i in range(0, E, chunk_size):
+                end_i = min(start_i + chunk_size, E)
+                ei_c = edge_index[:, start_i:end_i]
+                dst_c = ei_c[1]
+                logits_c, msg_hat_c, eta_penalty_c = self._compute_edge_terms_all(h, ei_c, edge_static[start_i:end_i], need_logits=need_logits)
+                if self.attn_mode == 'degree':
+                    alpha = deg_inv[dst_c].unsqueeze(-1).expand(-1, self.M)
+                else:
+                    alpha = torch.sigmoid(logits_c) * deg_inv[dst_c].unsqueeze(-1)
                 alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
                 alpha = F.dropout(alpha, p=self.attn_dropout, training=self.training)
-                msg = alpha.unsqueeze(-1).to(msg_hat.dtype) * msg_hat
-                msg = nan_to_num_safe(msg)
-                updates_sum.index_add_(0, dst, msg)
-                eta_penalties.append(eta_penalty)
+                self._add_messages(updates_heads, dst_c, alpha, msg_hat_c)
+                eta_acc = eta_acc + eta_penalty_c * float(end_i - start_i)
+                eta_weight += end_i - start_i
+        elif chunk_size >= E:
+            logits, msg_hat, eta_penalty = self._compute_edge_terms_all(h, edge_index, edge_static, need_logits=True)
+            alpha = self._group_softmax_2d(logits, dst_all, N)
+            alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
+            alpha = F.dropout(alpha, p=self.attn_dropout, training=self.training)
+            self._add_messages(updates_heads, dst_all, alpha, msg_hat)
+            eta_acc = eta_penalty * float(E)
+            eta_weight = E
         else:
-            for m in range(self.M):
-                max_per_dst = torch.full((N,), -torch.inf, dtype=h.real.dtype, device=h.device)
-                with torch.no_grad():
-                    for start_i in range(0, E, chunk_size):
-                        end_i = min(start_i + chunk_size, E)
-                        ei_c = edge_index[:, start_i:end_i]
-                        dst_c = ei_c[1]
-                        logits_c, _, _ = self._compute_edge_terms(h, ei_c, x_view, degree_log, q_hat, m)
-                        self._scatter_amax_(max_per_dst, dst_c, logits_c)
-
-                sum_exp = torch.zeros((N,), dtype=h.real.dtype, device=h.device)
-                for start_i in range(0, E, chunk_size):
-                    end_i = min(start_i + chunk_size, E)
-                    ei_c = edge_index[:, start_i:end_i]
-                    dst_c = ei_c[1]
-                    logits_c, _, _ = self._compute_edge_terms(h, ei_c, x_view, degree_log, q_hat, m)
-                    exp_c = torch.exp((logits_c - max_per_dst[dst_c]).clamp(min=-80.0, max=80.0))
-                    sum_exp.index_add_(0, dst_c, exp_c)
-
-                eta_weighted_sum = h.real.new_tensor(0.0)
-                eta_weight = 0
-                for start_i in range(0, E, chunk_size):
-                    end_i = min(start_i + chunk_size, E)
-                    ei_c = edge_index[:, start_i:end_i]
-                    dst_c = ei_c[1]
-                    logits_c, msg_hat_c, eta_penalty_c = self._compute_edge_terms(h, ei_c, x_view, degree_log, q_hat, m)
-                    exp_c = torch.exp((logits_c - max_per_dst[dst_c]).clamp(min=-80.0, max=80.0))
-                    alpha = exp_c / sum_exp[dst_c].clamp_min(self.eps)
-                    alpha = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
-                    alpha = F.dropout(alpha, p=self.attn_dropout, training=self.training)
-                    msg = alpha.unsqueeze(-1).to(msg_hat_c.dtype) * msg_hat_c
-                    msg = nan_to_num_safe(msg)
-                    updates_sum.index_add_(0, dst_c, msg)
-                    eta_weighted_sum = eta_weighted_sum + eta_penalty_c * float(end_i - start_i)
-                    eta_weight += end_i - start_i
-                eta_penalties.append(eta_weighted_sum / max(1, eta_weight))
+            logits_all = torch.empty((E, self.M), dtype=h.real.dtype, device=h.device)
+            for start_i in range(0, E, chunk_size):
+                end_i = min(start_i + chunk_size, E)
+                logits_c, _, eta_penalty_c = self._compute_edge_terms_all(h, edge_index[:, start_i:end_i], edge_static[start_i:end_i], need_logits=True)
+                logits_all[start_i:end_i] = logits_c
+                eta_acc = eta_acc + eta_penalty_c * float(end_i - start_i)
+                eta_weight += end_i - start_i
+            alpha_all = self._group_softmax_2d(logits_all, dst_all, N)
+            alpha_all = torch.nan_to_num(alpha_all, nan=0.0, posinf=0.0, neginf=0.0)
+            alpha_all = F.dropout(alpha_all, p=self.attn_dropout, training=self.training)
+            for start_i in range(0, E, chunk_size):
+                end_i = min(start_i + chunk_size, E)
+                _, msg_hat_c, _ = self._compute_edge_terms_all(h, edge_index[:, start_i:end_i], edge_static[start_i:end_i], need_logits=False)
+                self._add_messages(updates_heads, edge_index[1, start_i:end_i], alpha_all[start_i:end_i], msg_hat_c)
+        updates_sum = updates_heads.sum(dim=0)
         h_new = h + updates_sum
         h_new = nan_to_num_safe(h_new)
         h_next = self.act(self.nodenorm(h_new))
-        eta_penalty = torch.stack(eta_penalties).mean() if eta_penalties else h.real.new_tensor(0.0)
+        eta_penalty = eta_acc / max(1, eta_weight) if eta_weight > 0 else h.real.new_tensor(0.0)
         return (h_next, eta_penalty) if return_aux else h_next
 
 class HomophilyMLPBranch(nn.Module):
@@ -890,7 +788,7 @@ class InvariantGramReadout(nn.Module):
 
 class ASCiiNet(nn.Module):
 
-    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, edge_index: Tensor, num_nodes: int, num_heads: int=4, gamma: float=0.1, attn_dropout: float=0.2, feat_dropout: float=0.5, readout_dropout: float=0.5, layers: int=2, eta_max: float=0.75, eta_bar: float=0.5, lambda_attn: float=0.5, alpha_skip: float=0.1, jk_mode: str='concat', readout_rank: int=16, readout_hidden: int=0, use_nodenorm: bool=True, use_phase: bool=True, phase_scale: float=1.0, edge_chunk_size: int=200000, static_chunk_size: int=500000, checkpoint_layers: bool=False, attn_mode: str='softmax', use_homo_branch: bool=False, homo_branch_hidden: int=128, homo_branch_dropout: float=0.5, homo_branch_layers: int=2, homo_branch_weight: float=0.35, homo_branch_max_weight: float=0.7, learn_homo_branch_weight: bool=True):
+    def __init__(self, in_dim: int, hidden_dim: int, num_classes: int, edge_index: Tensor, num_nodes: int, num_heads: int=4, gamma: float=0.1, attn_dropout: float=0.2, feat_dropout: float=0.5, readout_dropout: float=0.5, layers: int=2, eta_max: float=0.75, eta_bar: float=0.5, lambda_attn: float=0.5, alpha_skip: float=0.1, jk_mode: str='concat', readout_rank: int=16, readout_hidden: int=0, use_nodenorm: bool=True, use_phase: bool=True, phase_scale: float=1.0, edge_chunk_size: int=0, static_chunk_size: int=0, checkpoint_layers: bool=False, attn_mode: str='softmax', use_homo_branch: bool=False, homo_branch_hidden: int=128, homo_branch_dropout: float=0.5, homo_branch_layers: int=2, homo_branch_weight: float=0.35, homo_branch_max_weight: float=0.7, learn_homo_branch_weight: bool=True):
         super().__init__()
         assert jk_mode in ['last', 'concat', 'mean']
         self.edge_index = edge_index
@@ -954,11 +852,7 @@ class ASCiiNet(nn.Module):
         eta_losses = []
         for layer in self.layers:
             if self.checkpoint_layers and self.training:
-                h_new, eta_loss = checkpoint(
-                    lambda h_in, layer=layer: layer(h_in, ei, self.x_view, self.degree_log, self.q_hat, return_aux=True),
-                    h,
-                    use_reentrant=False,
-                )
+                h_new, eta_loss = checkpoint(lambda h_in, layer=layer: layer(h_in, ei, self.x_view, self.degree_log, self.q_hat, return_aux=True), h, use_reentrant=False)
             else:
                 h_new, eta_loss = layer(h, ei, self.x_view, self.degree_log, self.q_hat, return_aux=True)
             h = (1.0 - self.alpha_skip) * h_new + self.alpha_skip * h0
@@ -988,14 +882,13 @@ def require_ogb() -> None:
     if PygNodePropPredDataset is None or Evaluator is None:
         raise ImportError("OGB datasets require the 'ogb' package. Install with: pip install ogb")
 
-
 def make_mask(num_nodes: int, idx: Tensor) -> Tensor:
     mask = torch.zeros(num_nodes, dtype=torch.bool)
     mask[idx.view(-1).long()] = True
     return mask
 
-
 def attach_split_masks(data: Data, split_idx, node_type: Optional[str]=None) -> Data:
+
     def pick(split_name: str) -> Tensor:
         value = split_idx[split_name]
         if isinstance(value, dict):
@@ -1003,12 +896,10 @@ def attach_split_masks(data: Data, split_idx, node_type: Optional[str]=None) -> 
                 raise ValueError('node_type must be provided for heterogeneous OGB splits.')
             value = value[node_type]
         return value
-
     data.train_mask = make_mask(data.num_nodes, pick('train'))
     data.val_mask = make_mask(data.num_nodes, pick('valid'))
     data.test_mask = make_mask(data.num_nodes, pick('test'))
     return data
-
 
 def add_ogbn_proteins_features(data: Data, edge_attr_chunk_size: int=1000000) -> Data:
     if getattr(data, 'x', None) is None:
@@ -1026,7 +917,6 @@ def add_ogbn_proteins_features(data: Data, edge_attr_chunk_size: int=1000000) ->
     gc.collect()
     return data
 
-
 def infer_num_node_features(dataset, data) -> int:
     value = getattr(dataset, 'num_node_features', None)
     if value is not None and int(value) > 0:
@@ -1036,7 +926,6 @@ def infer_num_node_features(dataset, data) -> int:
         return int(value)
     return int(data.x.size(-1))
 
-
 def infer_num_classes(dataset, data) -> int:
     if getattr(data, 'task_type', 'multiclass') == 'multilabel':
         return int(data.y.size(-1))
@@ -1045,18 +934,15 @@ def infer_num_classes(dataset, data) -> int:
         return int(value)
     return int(data.y.max().item() + 1)
 
-
 def supervised_loss(logits: Tensor, y: Tensor, mask: Tensor, task_type: str, label_smooth: float=0.0) -> Tensor:
     if task_type == 'multilabel':
         return F.binary_cross_entropy_with_logits(logits[mask], y[mask].float())
     return cross_entropy_with_label_smoothing(logits[mask], y[mask].view(-1).long(), smoothing=label_smooth)
 
-
 def prediction_consistency(logits1: Tensor, logits2_detached: Tensor, task_type: str, T: float=2.0) -> Tensor:
     if task_type == 'multilabel':
         return F.mse_loss(torch.sigmoid(logits1), torch.sigmoid(logits2_detached))
     return js_consistency(logits1, logits2_detached, T=T)
-
 
 def supervised_loss_from_logits(logits: Tensor, y: Tensor, task_type: str, label_smooth: float=0.0) -> Tensor:
     if task_type == 'multilabel':
@@ -1082,11 +968,9 @@ def homophily_auxiliary_root_loss(model: nn.Module, y_root: Tensor, task_type: s
         return model_zero(model)
     return supervised_loss_from_logits(logits[:y_root.size(0)], y_root, task_type, label_smooth=label_smooth)
 
-
 def require_neighbor_loader() -> None:
     if NeighborLoader is None:
         raise ImportError('Mini-batch training requires torch_geometric.loader.NeighborLoader.')
-
 
 def parse_num_neighbors(value: Optional[str], layers: int) -> List[int]:
     layers = max(1, int(layers))
@@ -1104,23 +988,14 @@ def parse_num_neighbors(value: Optional[str], layers: int) -> List[int]:
         nums = nums + [nums[-1]] * (layers - len(nums))
     return nums[:layers]
 
-
 def make_neighbor_loader(data: Data, input_nodes, num_neighbors: List[int], batch_size: int, shuffle: bool, num_workers: int, device: torch.device):
     require_neighbor_loader()
-    kwargs = dict(
-        data=data,
-        input_nodes=input_nodes,
-        num_neighbors=num_neighbors,
-        batch_size=int(batch_size),
-        shuffle=bool(shuffle),
-        num_workers=int(num_workers),
-    )
+    kwargs = dict(data=data, input_nodes=input_nodes, num_neighbors=num_neighbors, batch_size=int(batch_size), shuffle=bool(shuffle), num_workers=int(num_workers))
     if int(num_workers) > 0:
         kwargs['persistent_workers'] = True
     if device.type == 'cuda':
         kwargs['pin_memory'] = True
     return NeighborLoader(**kwargs)
-
 
 def finite_gradients(model: nn.Module) -> bool:
     for p in model.parameters():
@@ -1128,26 +1003,16 @@ def finite_gradients(model: nn.Module) -> bool:
             return False
     return True
 
-
 def train_minibatch_epoch(model: nn.Module, data: Data, args, device: torch.device, epoch: int, opt, scheduler) -> Tuple[float, float, float, float]:
     task_type = getattr(data, 'task_type', 'multiclass')
     train_neighbors = parse_num_neighbors(args.num_neighbors, args.layers)
-    loader = make_neighbor_loader(
-        data=data,
-        input_nodes=data.train_mask,
-        num_neighbors=train_neighbors,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        device=device,
-    )
+    loader = make_neighbor_loader(data=data, input_nodes=data.train_mask, num_neighbors=train_neighbors, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
     model.train()
     total_examples = 0
     total_loss = 0.0
     total_ce = 0.0
     total_cons = 0.0
     total_eta = 0.0
-
     for step, batch in enumerate(loader, start=1):
         batch = batch.to(device, non_blocking=True)
         if args.batch_self_loops:
@@ -1160,7 +1025,6 @@ def train_minibatch_epoch(model: nn.Module, data: Data, args, device: torch.devi
         ce_main = supervised_loss_from_logits(root_logits1, root_y, task_type, label_smooth=args.label_smooth)
         homo_aux = homophily_auxiliary_root_loss(model, root_y, task_type, label_smooth=args.label_smooth)
         ce = ce_main + args.homo_aux_w * homo_aux
-
         if args.consistency_w > 0.0:
             ei2 = dropedge(batch.edge_index, args.dropedge, training=True)
             logits2, eta_loss2 = model(batch.x, edge_index_override=ei2, return_aux=True, recompute_static=True)
@@ -1169,7 +1033,6 @@ def train_minibatch_epoch(model: nn.Module, data: Data, args, device: torch.devi
         else:
             cons = root_logits1.new_tensor(0.0)
             eta_loss = eta_loss1
-
         loss = ce + args.consistency_w * cons + args.eta_reg * eta_loss
         if epoch <= args.warmup:
             loss = loss * (epoch / max(1, args.warmup))
@@ -1177,7 +1040,6 @@ def train_minibatch_epoch(model: nn.Module, data: Data, args, device: torch.devi
             print('[warn] non-finite mini-batch loss detected; skipping step')
             opt.zero_grad(set_to_none=True)
             continue
-
         opt.zero_grad(set_to_none=True)
         loss.backward()
         if not finite_gradients(model):
@@ -1186,22 +1048,18 @@ def train_minibatch_epoch(model: nn.Module, data: Data, args, device: torch.devi
             continue
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0, error_if_nonfinite=False)
         opt.step()
-
         weight = max(1, root_size)
         total_examples += weight
         total_loss += float(loss.detach().item()) * weight
         total_ce += float(ce.detach().item()) * weight
         total_cons += float(cons.detach().item()) * weight
         total_eta += float(eta_loss.detach().item()) * weight
-
         del batch, logits1, root_logits1, root_y, loss, ce, cons, eta_loss
-        if device.type == 'cuda' and args.empty_cache_steps > 0 and step % args.empty_cache_steps == 0:
+        if device.type == 'cuda' and args.empty_cache_steps > 0 and (step % args.empty_cache_steps == 0):
             torch.cuda.empty_cache()
-
     scheduler.step()
     denom = max(1, total_examples)
     return (total_loss / denom, total_ce / denom, total_cons / denom, total_eta / denom)
-
 
 @torch.no_grad()
 def evaluate_minibatch(model: nn.Module, data: Data, args, device: torch.device) -> Tuple[float, float, float, Optional[Tensor]]:
@@ -1213,15 +1071,7 @@ def evaluate_minibatch(model: nn.Module, data: Data, args, device: torch.device)
     def eval_split(mask: Tensor) -> float:
         if int(mask.sum().item()) == 0:
             return float('nan')
-        loader = make_neighbor_loader(
-            data=data,
-            input_nodes=mask,
-            num_neighbors=eval_neighbors,
-            batch_size=args.eval_batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            device=device,
-        )
+        loader = make_neighbor_loader(data=data, input_nodes=mask, num_neighbors=eval_neighbors, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.num_workers, device=device)
         if eval_metric == 'rocauc':
             y_true_chunks = []
             y_pred_chunks = []
@@ -1235,11 +1085,7 @@ def evaluate_minibatch(model: nn.Module, data: Data, args, device: torch.device)
                 y_pred_chunks.append(torch.sigmoid(logits).detach().cpu())
                 del batch, logits
             evaluator = Evaluator(name=data.ogb_name)
-            return evaluator.eval({
-                'y_true': torch.cat(y_true_chunks, dim=0),
-                'y_pred': torch.cat(y_pred_chunks, dim=0),
-            })['rocauc']
-
+            return evaluator.eval({'y_true': torch.cat(y_true_chunks, dim=0), 'y_pred': torch.cat(y_pred_chunks, dim=0)})['rocauc']
         correct = 0
         total = 0
         for batch in loader:
@@ -1254,14 +1100,12 @@ def evaluate_minibatch(model: nn.Module, data: Data, args, device: torch.device)
             total += int(root_size)
             del batch, logits, pred, y
         return float(correct) / max(1, total)
-
     train_score = eval_split(data.train_mask) if args.eval_train else float('nan')
     val_score = eval_split(data.val_mask)
     test_score = eval_split(data.test_mask)
     if device.type == 'cuda':
         torch.cuda.empty_cache()
     return (train_score, val_score, test_score, None)
-
 
 def load_dataset(data_id: int, device: Optional[torch.device]=None):
     if data_id == 0:
@@ -1311,26 +1155,17 @@ def load_dataset(data_id: int, device: Optional[torch.device]=None):
         require_ogb()
         dataset = PygNodePropPredDataset(name='ogbn-mag', root='/tmp/ogbn_mag')
         raw_data = dataset[0]
-    
         if hasattr(raw_data, 'x_dict'):
             x = raw_data.x_dict['paper']
-            edge_index = raw_data.edge_index_dict[('paper', 'cites', 'paper')]
+            edge_index = raw_data.edge_index_dict['paper', 'cites', 'paper']
             y = raw_data.y_dict['paper'].view(-1).long()
             num_nodes = raw_data.num_nodes_dict['paper']
-    
         else:
             x = raw_data['paper'].x
             edge_index = raw_data['paper', 'cites', 'paper'].edge_index
             y = raw_data['paper'].y.view(-1).long()
             num_nodes = raw_data['paper'].num_nodes
-    
-        data = Data(
-            x=x,
-            edge_index=edge_index,
-            y=y,
-            num_nodes=num_nodes,
-        )
-    
+        data = Data(x=x, edge_index=edge_index, y=y, num_nodes=num_nodes)
         data = attach_split_masks(data, dataset.get_idx_split(), node_type='paper')
         data.ogb_name = 'ogbn-mag'
         data.eval_metric = 'acc'
@@ -1377,7 +1212,6 @@ def evaluate(model: nn.Module, data, args) -> Tuple[float, float, float, Tensor]
     pred_eval = logits_eval
     task_type = getattr(data, 'task_type', 'multiclass')
     eval_metric = getattr(data, 'eval_metric', 'acc')
-
     if task_type != 'multilabel' and args.use_cs:
         y_smooth = correct_and_smooth_compat(logits_eval, data.y, data.train_mask, data.edge_index, cs_corr_layers=args.cs_corr_layers, cs_corr_alpha=args.cs_corr_alpha, cs_smooth_layers=args.cs_smooth_layers, cs_smooth_alpha=args.cs_smooth_alpha, autoscale=True)
         pred_eval = (y_smooth + 1e-12).log()
@@ -1386,7 +1220,6 @@ def evaluate(model: nn.Module, data, args) -> Tuple[float, float, float, Tensor]
         y_lp = lp(data.y, data.edge_index, mask=data.train_mask)
         probs = F.softmax(pred_eval, dim=-1) * (1.0 - args.lp_blend) + y_lp * args.lp_blend
         pred_eval = (probs + 1e-12).log()
-
     if eval_metric == 'rocauc':
         evaluator = Evaluator(name=data.ogb_name)
         scores = torch.sigmoid(pred_eval)
@@ -1394,7 +1227,6 @@ def evaluate(model: nn.Module, data, args) -> Tuple[float, float, float, Tensor]
         val_score = evaluator.eval({'y_true': data.y[data.val_mask].detach().cpu(), 'y_pred': scores[data.val_mask].detach().cpu()})['rocauc']
         test_score = evaluator.eval({'y_true': data.y[data.test_mask].detach().cpu(), 'y_pred': scores[data.test_mask].detach().cpu()})['rocauc']
         return (train_score, val_score, test_score, pred_eval)
-
     pred = pred_eval.argmax(dim=1)
     if hasattr(data, 'ogb_name') and data.ogb_name in ['ogbn-arxiv', 'ogbn-mag']:
         evaluator = Evaluator(name=data.ogb_name)
@@ -1420,11 +1252,7 @@ def apply_homophily_defaults(args, provided: set) -> None:
         args.use_homo_feature_boost = True
     if args.use_homo_branch is None:
         args.use_homo_branch = True
-    profile = {
-        0: dict(lr=0.003, weight_decay=0.001, hidden=128, readout_rank=24, readout_hidden=128, feat_dropout=0.55, readout_dropout=0.55, attn_dropout=0.15, dropedge=0.10, label_smooth=0.03, consistency_w=0.05, warmup=30, patience=300, homo_branch_weight=0.35, homo_aux_w=0.45, lp_blend=0.25),
-        1: dict(lr=0.003, weight_decay=0.001, hidden=128, readout_rank=24, readout_hidden=128, feat_dropout=0.60, readout_dropout=0.55, attn_dropout=0.15, dropedge=0.12, label_smooth=0.04, consistency_w=0.05, warmup=30, patience=300, homo_branch_weight=0.40, homo_aux_w=0.50, lp_blend=0.25),
-        2: dict(lr=0.0025, weight_decay=0.0005, hidden=128, readout_rank=24, readout_hidden=128, feat_dropout=0.45, readout_dropout=0.50, attn_dropout=0.10, dropedge=0.08, label_smooth=0.02, consistency_w=0.03, warmup=30, patience=300, homo_branch_weight=0.30, homo_aux_w=0.35, lp_blend=0.20),
-    }[int(args.data)]
+    profile = {0: dict(lr=0.003, weight_decay=0.001, hidden=128, readout_rank=24, readout_hidden=128, feat_dropout=0.55, readout_dropout=0.55, attn_dropout=0.15, dropedge=0.1, label_smooth=0.03, consistency_w=0.05, warmup=30, patience=300, homo_branch_weight=0.35, homo_aux_w=0.45, lp_blend=0.25), 1: dict(lr=0.003, weight_decay=0.001, hidden=128, readout_rank=24, readout_hidden=128, feat_dropout=0.6, readout_dropout=0.55, attn_dropout=0.15, dropedge=0.12, label_smooth=0.04, consistency_w=0.05, warmup=30, patience=300, homo_branch_weight=0.4, homo_aux_w=0.5, lp_blend=0.25), 2: dict(lr=0.0025, weight_decay=0.0005, hidden=128, readout_rank=24, readout_hidden=128, feat_dropout=0.45, readout_dropout=0.5, attn_dropout=0.1, dropedge=0.08, label_smooth=0.02, consistency_w=0.03, warmup=30, patience=300, homo_branch_weight=0.3, homo_aux_w=0.35, lp_blend=0.2)}[int(args.data)]
     for key, value in profile.items():
         set_if_unprovided(args, provided, key, value)
     set_if_unprovided(args, provided, 'layers', 2)
@@ -1449,21 +1277,13 @@ def apply_homophily_defaults(args, provided: set) -> None:
     set_if_unprovided(args, provided, 'homo_branch_max_weight', 0.65)
     set_if_unprovided(args, provided, 'learn_homo_branch_weight', True)
 
-
 def resolve_base_model(args) -> str:
-    """Auto policy: use the non-adaptive GESC baseline on Cora, ASCii elsewhere."""
     requested = str(args.base_model).lower()
     if requested != 'auto':
         return requested
     return 'gesc' if int(args.data) == 0 else 'adaptive'
 
-
 def apply_gesc_defaults(args, provided: set) -> None:
-    """Restore the attached non-adaptive GESC defaults for selected datasets.
-
-    This intentionally runs *after* apply_homophily_defaults so Cora can fall
-    back to the simpler baseline unless the user explicitly overrides a value.
-    """
     set_if_unprovided(args, provided, 'lr', 0.001)
     set_if_unprovided(args, provided, 'weight_decay', 0.0005)
     set_if_unprovided(args, provided, 'heads', 4)
@@ -1499,73 +1319,41 @@ def apply_gesc_defaults(args, provided: set) -> None:
     set_if_unprovided(args, provided, 'use_homo_branch', False)
     set_if_unprovided(args, provided, 'homo_aux_w', 0.0)
     set_if_unprovided(args, provided, 'eta_reg', 0.0)
-
-# -----------------------------------------------------------------------------
-# Unified training entry points with epoch-wise time / memory reporting only.
-# -----------------------------------------------------------------------------
 import resource
 import time
 
-
 def cpu_max_rss_mb() -> float:
-    """Return process max resident set size in MB."""
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # Linux reports KB; macOS reports bytes.
     if sys.platform == 'darwin':
         return float(rss) / (1024.0 * 1024.0)
     return float(rss) / 1024.0
-
 
 def begin_epoch_profile(device: torch.device) -> Tuple[float, float]:
     gc.collect()
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
-    return time.perf_counter(), cpu_max_rss_mb()
-
+    return (time.perf_counter(), cpu_max_rss_mb())
 
 def end_epoch_profile(device: torch.device, start_time: float, start_cpu_mb: float) -> dict:
     if device.type == 'cuda':
         torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - start_time
     cpu_mb = cpu_max_rss_mb()
-    out = {
-        'time_sec': elapsed,
-        'cpu_max_rss_mb': cpu_mb,
-        'cpu_delta_max_rss_mb': max(0.0, cpu_mb - start_cpu_mb),
-    }
+    out = {'time_sec': elapsed, 'cpu_max_rss_mb': cpu_mb, 'cpu_delta_max_rss_mb': max(0.0, cpu_mb - start_cpu_mb)}
     if device.type == 'cuda':
-        out.update({
-            'cuda_alloc_mb': torch.cuda.memory_allocated(device) / (1024.0 ** 2),
-            'cuda_reserved_mb': torch.cuda.memory_reserved(device) / (1024.0 ** 2),
-            'cuda_peak_alloc_mb': torch.cuda.max_memory_allocated(device) / (1024.0 ** 2),
-            'cuda_peak_reserved_mb': torch.cuda.max_memory_reserved(device) / (1024.0 ** 2),
-        })
+        out.update({'cuda_alloc_mb': torch.cuda.memory_allocated(device) / 1024.0 ** 2, 'cuda_reserved_mb': torch.cuda.memory_reserved(device) / 1024.0 ** 2, 'cuda_peak_alloc_mb': torch.cuda.max_memory_allocated(device) / 1024.0 ** 2, 'cuda_peak_reserved_mb': torch.cuda.max_memory_reserved(device) / 1024.0 ** 2})
     return out
 
-
 def print_epoch_cost(prefix: str, epoch: int, stats: dict) -> None:
-    msg = (
-        f'[{prefix}][epoch={epoch:04d}] '
-        f'time={stats["time_sec"]:.4f}s | '
-        f'cpu_max_rss={stats["cpu_max_rss_mb"]:.2f}MB | '
-        f'cpu_delta_max_rss={stats["cpu_delta_max_rss_mb"]:.2f}MB'
-    )
+    msg = f"[{prefix}][epoch={epoch:04d}] time={stats['time_sec']:.4f}s | cpu_max_rss={stats['cpu_max_rss_mb']:.2f}MB | cpu_delta_max_rss={stats['cpu_delta_max_rss_mb']:.2f}MB"
     if 'cuda_peak_alloc_mb' in stats:
-        msg += (
-            f' | cuda_alloc={stats["cuda_alloc_mb"]:.2f}MB'
-            f' | cuda_peak_alloc={stats["cuda_peak_alloc_mb"]:.2f}MB'
-            f' | cuda_reserved={stats["cuda_reserved_mb"]:.2f}MB'
-            f' | cuda_peak_reserved={stats["cuda_peak_reserved_mb"]:.2f}MB'
-        )
+        msg += f" | cuda_alloc={stats['cuda_alloc_mb']:.2f}MB | cuda_peak_alloc={stats['cuda_peak_alloc_mb']:.2f}MB | cuda_reserved={stats['cuda_reserved_mb']:.2f}MB | cuda_peak_reserved={stats['cuda_peak_reserved_mb']:.2f}MB"
     print(msg, flush=True)
 
-
 def apply_runtime_defaults(args, is_ogb: bool, impl: str) -> None:
-    """Set OGB-safe runtime defaults shared by both implementations."""
     if args.mini_batch is None:
         args.mini_batch = bool(is_ogb)
-
     if is_ogb and args.ogb_safe_defaults:
         args.mini_batch = True
         args.use_cs = False
@@ -1574,7 +1362,6 @@ def apply_runtime_defaults(args, is_ogb: bool, impl: str) -> None:
         args.eval_train = False
         args.eval_every = max(1, max(args.eval_every, 5))
         if impl == 'ascii':
-            args.checkpoint_layers = True
             if args.attn_mode == 'auto':
                 args.attn_mode = 'sigmoid_degree'
         if args.num_neighbors is None:
@@ -1590,7 +1377,6 @@ def apply_runtime_defaults(args, is_ogb: bool, impl: str) -> None:
         if args.static_chunk_size and args.static_chunk_size > 0:
             args.static_chunk_size = min(args.static_chunk_size, 50000)
         print(f'[info] {impl} OGB safe defaults: mini_batch=True, use_cs=False, use_lp=False, consistency_w=0')
-
     if args.mini_batch:
         require_neighbor_loader()
         if args.use_preprop:
@@ -1599,7 +1385,6 @@ def apply_runtime_defaults(args, is_ogb: bool, impl: str) -> None:
             raise ValueError('--use_homo_feature_boost is full-graph propagation and is disabled in --mini_batch mode.')
         args.use_cs = False
         args.use_lp = False
-
     if args.batch_size is None:
         args.batch_size = 1024
     if args.eval_batch_size is None:
@@ -1611,17 +1396,14 @@ def apply_runtime_defaults(args, is_ogb: bool, impl: str) -> None:
     if args.attn_mode == 'auto':
         args.attn_mode = 'softmax'
 
-
 def prepare_graph_and_features(args, dataset, data, device: torch.device, allow_homo_boost: bool):
     is_ogb = hasattr(data, 'ogb_name')
     make_undirected = args.undirected
     if make_undirected is None:
         make_undirected = not is_ogb
-
     add_loops = args.add_self_loops
     if add_loops is None:
         add_loops = not (is_ogb and args.mini_batch)
-
     if make_undirected:
         ei = to_undirected(data.edge_index, num_nodes=data.num_nodes)
     else:
@@ -1629,30 +1411,19 @@ def prepare_graph_and_features(args, dataset, data, device: torch.device, allow_
     if add_loops:
         ei, _ = add_remaining_self_loops(ei, num_nodes=data.num_nodes)
     data.edge_index = ei.contiguous()
-
     if args.mini_batch:
         model_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
     else:
         data = data.to(device)
         if allow_homo_boost and bool(args.use_homo_feature_boost):
-            data.x = build_homophilic_features(
-                data.x,
-                data.edge_index,
-                K=args.homo_prop_K,
-                alpha=args.homo_prop_alpha,
-                dropout=args.homo_prop_dropout,
-                mode=args.homo_feature_mode,
-                norm=args.homo_feature_norm,
-            )
+            data.x = build_homophilic_features(data.x, data.edge_index, K=args.homo_prop_K, alpha=args.homo_prop_alpha, dropout=args.homo_prop_dropout, mode=args.homo_feature_mode, norm=args.homo_feature_norm)
         elif args.use_preprop:
             appnp = APPNP(K=args.preprop_K, alpha=args.preprop_alpha, dropout=args.preprop_dropout).to(device)
             appnp.eval()
             with torch.no_grad():
                 data.x = appnp(data.x, data.edge_index)
         model_edge_index = data.edge_index
-
-    return data, model_edge_index, int(data.x.size(-1)), infer_num_classes(dataset, data)
-
+    return (data, model_edge_index, int(data.x.size(-1)), infer_num_classes(dataset, data))
 
 def train_getsic_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int, opt, scheduler) -> None:
     model.train()
@@ -1660,14 +1431,12 @@ def train_getsic_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int,
     ei1 = dropedge(data.edge_index, args.dropedge, training=True)
     logits1 = model(data.x, edge_index_override=ei1)
     ce = supervised_loss(logits1, data.y, data.train_mask, task_type, label_smooth=args.label_smooth)
-
     if args.consistency_w > 0.0:
         ei2 = dropedge(data.edge_index, args.dropedge, training=True)
         logits2 = model(data.x, edge_index_override=ei2)
         cons = prediction_consistency(logits1, logits2.detach(), task_type, T=args.cons_T)
     else:
         cons = logits1.new_tensor(0.0)
-
     loss = ce + args.consistency_w * cons
     if epoch <= args.warmup:
         loss = loss * (epoch / max(1, args.warmup))
@@ -1675,7 +1444,6 @@ def train_getsic_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int,
         print('[warn] non-finite GETSIC loss detected; skipping step')
         opt.zero_grad(set_to_none=True)
         return
-
     opt.zero_grad(set_to_none=True)
     loss.backward()
     if not finite_gradients(model):
@@ -1686,46 +1454,32 @@ def train_getsic_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int,
     opt.step()
     scheduler.step()
 
-
 def train_getsic_minibatch_epoch(model: nn.Module, data: Data, args, device: torch.device, epoch: int, opt, scheduler) -> None:
     task_type = getattr(data, 'task_type', 'multiclass')
     train_neighbors = parse_num_neighbors(args.num_neighbors, args.layers)
-    loader = make_neighbor_loader(
-        data=data,
-        input_nodes=data.train_mask,
-        num_neighbors=train_neighbors,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        device=device,
-    )
+    loader = make_neighbor_loader(data=data, input_nodes=data.train_mask, num_neighbors=train_neighbors, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
     model.train()
-
     for step, batch in enumerate(loader, start=1):
         batch = batch.to(device, non_blocking=True)
         if args.batch_self_loops:
             batch.edge_index, _ = add_remaining_self_loops(batch.edge_index, num_nodes=batch.num_nodes)
         root_size = int(batch.batch_size)
-
         ei1 = dropedge(batch.edge_index, args.dropedge, training=True)
         logits1 = model(batch.x, edge_index_override=ei1)
         root_logits1 = logits1[:root_size]
         root_y = batch.y[:root_size]
         loss = supervised_loss_from_logits(root_logits1, root_y, task_type, label_smooth=args.label_smooth)
-
         if args.consistency_w > 0.0:
             ei2 = dropedge(batch.edge_index, args.dropedge, training=True)
             logits2 = model(batch.x, edge_index_override=ei2)
             cons = prediction_consistency(root_logits1, logits2[:root_size].detach(), task_type, T=args.cons_T)
             loss = loss + args.consistency_w * cons
-
         if epoch <= args.warmup:
             loss = loss * (epoch / max(1, args.warmup))
         if not torch.isfinite(loss):
             print('[warn] non-finite GETSIC mini-batch loss detected; skipping step')
             opt.zero_grad(set_to_none=True)
             continue
-
         opt.zero_grad(set_to_none=True)
         loss.backward()
         if not finite_gradients(model):
@@ -1734,15 +1488,12 @@ def train_getsic_minibatch_epoch(model: nn.Module, data: Data, args, device: tor
             continue
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0, error_if_nonfinite=False)
         opt.step()
-
         del batch, logits1, root_logits1, root_y, loss
-        if device.type == 'cuda' and args.empty_cache_steps > 0 and step % args.empty_cache_steps == 0:
+        if device.type == 'cuda' and args.empty_cache_steps > 0 and (step % args.empty_cache_steps == 0):
             torch.cuda.empty_cache()
-
     scheduler.step()
 
-
-def run_getsic(raw_args, provided: Optional[set] = None) -> None:
+def run_getsic(raw_args, provided: Optional[set]=None) -> None:
     del provided
     args = copy.deepcopy(raw_args)
     args.resolved_base_model = 'getsic'
@@ -1752,37 +1503,14 @@ def run_getsic(raw_args, provided: Optional[set] = None) -> None:
         args.use_homo_branch = False
     set_seed(args.seed)
     device = torch.device(args.device)
-
     dataset, data = load_dataset(args.data, device=None)
     is_ogb = hasattr(data, 'ogb_name')
     apply_runtime_defaults(args, is_ogb=is_ogb, impl='getsic')
-    data, model_edge_index, in_dim, num_classes = prepare_graph_and_features(
-        args, dataset, data, device, allow_homo_boost=False
-    )
-
+    data, model_edge_index, in_dim, num_classes = prepare_graph_and_features(args, dataset, data, device, allow_homo_boost=False)
     jk_mode = 'mean' if args.jk == 'last' else args.jk
-    model = GETSICSoftmaxNet(
-        in_dim=in_dim,
-        hidden_dim=args.hidden,
-        num_classes=num_classes,
-        edge_index=model_edge_index,
-        num_nodes=data.num_nodes,
-        num_heads=args.heads,
-        gamma=args.gamma,
-        attn_dropout=args.attn_dropout,
-        feat_dropout=args.feat_dropout,
-        layers=args.layers,
-        sic_first=args.sic_first,
-        alpha_skip=args.alpha_skip,
-        jk_mode=jk_mode,
-        use_nodenorm=args.use_nodenorm,
-    ).to(device)
-
+    model = GETSICSoftmaxNet(in_dim=in_dim, hidden_dim=args.hidden, num_classes=num_classes, edge_index=model_edge_index, num_nodes=data.num_nodes, num_heads=args.heads, gamma=args.gamma, attn_dropout=args.attn_dropout, feat_dropout=args.feat_dropout, layers=args.layers, sic_first=args.sic_first, alpha_skip=args.alpha_skip, jk_mode=jk_mode, use_nodenorm=args.use_nodenorm).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_lr_scale
-    )
-
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_lr_scale)
     print(f'[info] impl=getsic data={args.data} mini_batch={args.mini_batch} hidden={args.hidden} layers={args.layers} heads={args.heads}')
     for epoch in range(1, args.epochs + 1):
         start, start_cpu = begin_epoch_profile(device)
@@ -1795,62 +1523,10 @@ def run_getsic(raw_args, provided: Optional[set] = None) -> None:
         if device.type == 'cuda' and args.empty_cache_steps > 0:
             torch.cuda.empty_cache()
 
-
 def build_ascii_model(args, data: Data, model_edge_index: Tensor, in_dim: int, num_classes: int, device: torch.device) -> nn.Module:
     if args.resolved_base_model == 'gesc':
-        return GESCSoftmaxNet(
-            in_dim=in_dim,
-            hidden_dim=args.hidden,
-            num_classes=num_classes,
-            edge_index=model_edge_index,
-            num_nodes=data.num_nodes,
-            num_heads=args.heads,
-            gamma=args.gamma,
-            attn_dropout=args.attn_dropout,
-            feat_dropout=args.feat_dropout,
-            readout_dropout=args.readout_dropout,
-            layers=args.layers,
-            sic_first=args.sic_first,
-            alpha_skip=args.alpha_skip,
-            jk_mode=args.jk,
-            use_nodenorm=args.use_nodenorm,
-        ).to(device)
-
-    return ASCiiNet(
-        in_dim=in_dim,
-        hidden_dim=args.hidden,
-        num_classes=num_classes,
-        edge_index=model_edge_index,
-        num_nodes=data.num_nodes,
-        num_heads=args.heads,
-        gamma=args.gamma,
-        attn_dropout=args.attn_dropout,
-        feat_dropout=args.feat_dropout,
-        readout_dropout=args.readout_dropout,
-        layers=args.layers,
-        eta_max=args.eta_max,
-        eta_bar=args.eta_bar,
-        lambda_attn=args.lambda_attn,
-        alpha_skip=args.alpha_skip,
-        jk_mode=args.jk,
-        readout_rank=args.readout_rank,
-        readout_hidden=args.readout_hidden,
-        use_nodenorm=args.use_nodenorm,
-        use_phase=args.use_phase,
-        phase_scale=args.phase_scale,
-        edge_chunk_size=args.edge_chunk_size,
-        static_chunk_size=args.static_chunk_size,
-        checkpoint_layers=args.checkpoint_layers,
-        attn_mode=args.attn_mode,
-        use_homo_branch=bool(args.use_homo_branch),
-        homo_branch_hidden=args.homo_branch_hidden,
-        homo_branch_dropout=args.homo_branch_dropout,
-        homo_branch_layers=args.homo_branch_layers,
-        homo_branch_weight=args.homo_branch_weight,
-        homo_branch_max_weight=args.homo_branch_max_weight,
-        learn_homo_branch_weight=args.learn_homo_branch_weight,
-    ).to(device)
-
+        return GESCSoftmaxNet(in_dim=in_dim, hidden_dim=args.hidden, num_classes=num_classes, edge_index=model_edge_index, num_nodes=data.num_nodes, num_heads=args.heads, gamma=args.gamma, attn_dropout=args.attn_dropout, feat_dropout=args.feat_dropout, readout_dropout=args.readout_dropout, layers=args.layers, sic_first=args.sic_first, alpha_skip=args.alpha_skip, jk_mode=args.jk, use_nodenorm=args.use_nodenorm).to(device)
+    return ASCiiNet(in_dim=in_dim, hidden_dim=args.hidden, num_classes=num_classes, edge_index=model_edge_index, num_nodes=data.num_nodes, num_heads=args.heads, gamma=args.gamma, attn_dropout=args.attn_dropout, feat_dropout=args.feat_dropout, readout_dropout=args.readout_dropout, layers=args.layers, eta_max=args.eta_max, eta_bar=args.eta_bar, lambda_attn=args.lambda_attn, alpha_skip=args.alpha_skip, jk_mode=args.jk, readout_rank=args.readout_rank, readout_hidden=args.readout_hidden, use_nodenorm=args.use_nodenorm, use_phase=args.use_phase, phase_scale=args.phase_scale, edge_chunk_size=args.edge_chunk_size, static_chunk_size=args.static_chunk_size, checkpoint_layers=args.checkpoint_layers, attn_mode=args.attn_mode, use_homo_branch=bool(args.use_homo_branch), homo_branch_hidden=args.homo_branch_hidden, homo_branch_dropout=args.homo_branch_dropout, homo_branch_layers=args.homo_branch_layers, homo_branch_weight=args.homo_branch_weight, homo_branch_max_weight=args.homo_branch_max_weight, learn_homo_branch_weight=args.learn_homo_branch_weight).to(device)
 
 def train_ascii_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int, opt, scheduler) -> None:
     model.train()
@@ -1860,7 +1536,6 @@ def train_ascii_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int, 
     ce_main = supervised_loss(logits1, data.y, data.train_mask, task_type, label_smooth=args.label_smooth)
     homo_aux = homophily_auxiliary_loss(model, data.y, data.train_mask, task_type, label_smooth=args.label_smooth)
     ce = ce_main + args.homo_aux_w * homo_aux
-
     if args.consistency_w > 0.0:
         ei2 = dropedge(data.edge_index, args.dropedge, training=True)
         logits2, eta_loss2 = model(data.x, edge_index_override=ei2, return_aux=True)
@@ -1869,7 +1544,6 @@ def train_ascii_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int, 
     else:
         cons = logits1.new_tensor(0.0)
         eta_loss = eta_loss1
-
     loss = ce + args.consistency_w * cons + args.eta_reg * eta_loss
     if epoch <= args.warmup:
         loss = loss * (epoch / max(1, args.warmup))
@@ -1877,7 +1551,6 @@ def train_ascii_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int, 
         print('[warn] non-finite ASCii loss detected; skipping step')
         opt.zero_grad(set_to_none=True)
         return
-
     opt.zero_grad(set_to_none=True)
     loss.backward()
     if not finite_gradients(model):
@@ -1888,8 +1561,7 @@ def train_ascii_fullbatch_epoch(model: nn.Module, data: Data, args, epoch: int, 
     opt.step()
     scheduler.step()
 
-
-def run_ascii(raw_args, provided: Optional[set] = None) -> None:
+def run_ascii(raw_args, provided: Optional[set]=None) -> None:
     args = copy.deepcopy(raw_args)
     provided = set() if provided is None else provided
     apply_homophily_defaults(args, provided)
@@ -1897,34 +1569,24 @@ def run_ascii(raw_args, provided: Optional[set] = None) -> None:
     if args.resolved_base_model == 'gesc':
         apply_gesc_defaults(args, provided)
     set_seed(args.seed)
-
     if not 0.0 <= args.eta_max <= 1.0:
         raise ValueError('--eta_max must be in [0, 1].')
     if not 0.0 <= args.lambda_attn <= 1.0:
         raise ValueError('--lambda_attn must be in [0, 1].')
-
     device = torch.device(args.device)
     dataset, data = load_dataset(args.data, device=None)
     is_ogb = hasattr(data, 'ogb_name')
     apply_runtime_defaults(args, is_ogb=is_ogb, impl='ascii')
-    data, model_edge_index, in_dim, num_classes = prepare_graph_and_features(
-        args, dataset, data, device, allow_homo_boost=True
-    )
-
+    data, model_edge_index, in_dim, num_classes = prepare_graph_and_features(args, dataset, data, device, allow_homo_boost=True)
     model = build_ascii_model(args, data, model_edge_index, in_dim, num_classes, device)
     if not args.mini_batch and hasattr(model, 'prepare_static_graph'):
         model.prepare_static_graph(data.x, data.edge_index)
-
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_lr_scale
-    )
-
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=args.lr * args.cosine_min_lr_scale)
     print(f'[info] impl=ascii base_model={args.resolved_base_model} data={args.data} mini_batch={args.mini_batch} hidden={args.hidden} layers={args.layers} heads={args.heads}')
     if args.mini_batch:
         train_fanout = parse_num_neighbors(args.num_neighbors, args.layers)
         print(f'[info] mini_batch batch_size={args.batch_size}, train_neighbors={train_fanout}, attn_mode={args.attn_mode}')
-
     for epoch in range(1, args.epochs + 1):
         start, start_cpu = begin_epoch_profile(device)
         if args.mini_batch:
@@ -1935,7 +1597,6 @@ def run_ascii(raw_args, provided: Optional[set] = None) -> None:
         print_epoch_cost('ASCII', epoch, stats)
         if device.type == 'cuda' and args.empty_cache_steps > 0:
             torch.cuda.empty_cache()
-
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Unified GETSIC/ASCii runner with OGB support and epoch cost logging only')
@@ -1986,8 +1647,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--preprop_K', type=int, default=10)
     parser.add_argument('--preprop_alpha', type=float, default=0.1)
     parser.add_argument('--preprop_dropout', type=float, default=0.0)
-    parser.add_argument('--edge_chunk_size', type=int, default=50000, help='ASCii only: process edges in chunks to reduce peak memory. Set <=0 for original full-edge mode.')
-    parser.add_argument('--static_chunk_size', type=int, default=100000, help='ASCii only: chunk size for static graph statistics such as local inconsistency.')
+    parser.add_argument('--edge_chunk_size', type=int, default=0, help='ASCii only: process edges in chunks to reduce peak memory. Set <=0 for fastest full-edge mode.')
+    parser.add_argument('--static_chunk_size', type=int, default=0, help='ASCii only: chunk size for static graph statistics such as local inconsistency. Set <=0 for fastest mode.')
     parser.add_argument('--checkpoint_layers', action=argparse.BooleanOptionalAction, default=False, help='ASCii only: use activation checkpointing for ASCii layers.')
     parser.add_argument('--ogb_safe_defaults', action=argparse.BooleanOptionalAction, default=True, help='For OGB, use mini-batch training and disable memory-heavy full-graph postprocessing.')
     parser.add_argument('--eval_every', type=int, default=1, help='Kept for CLI compatibility; no performance evaluation is run.')
@@ -2020,22 +1681,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--homo_aux_w', type=float, default=0.45)
     return parser
 
-
 def main() -> None:
     provided_args = collect_provided_args(sys.argv[1:])
     args = build_arg_parser().parse_args()
-
     if args.impl in ['getsic', 'both']:
         run_getsic(args, provided_args)
-
     if args.impl == 'both':
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
     if args.impl in ['ascii', 'both']:
         run_ascii(args, provided_args)
-
-
 if __name__ == '__main__':
     main()
